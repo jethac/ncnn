@@ -34,6 +34,12 @@ public:
     Pipeline* pipeline_convolution1d;
     Pipeline* pipeline_convolution1d_1x1s1d1;
     Pipeline* pipeline_convolution1d_gemm;
+    Pipeline* pipeline_radish_planar_pad;
+
+    bool use_radish_tiled;
+    bool radish_tiled32;
+    bool radish_planar;
+    bool radish_pad_channels;
 
     // cooperative matrix
     bool use_cooperative_matrix;

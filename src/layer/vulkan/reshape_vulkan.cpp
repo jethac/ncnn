@@ -7,7 +7,26 @@
 #include "layer_type.h"
 #include "layer_shader_type.h"
 
+#include <limits>
+#include <stdlib.h>
+#include <string.h>
+
 namespace ncnn {
+
+#if NCNN_STRING
+static bool radish_norm_to3d_name(const std::string& name)
+{
+    const char* p = name.c_str();
+    if (strncmp(p, "radish_norm_", 12) != 0)
+        return false;
+    p += 12;
+    if (*p < '0' || *p > '9')
+        return false;
+    while (*p >= '0' && *p <= '9')
+        p++;
+    return strcmp(p, "_to3d") == 0;
+}
+#endif
 
 Reshape_vulkan::Reshape_vulkan()
 {
@@ -333,6 +352,34 @@ int Reshape_vulkan::forward(const std::vector<VkMat>& bottom_blobs, std::vector<
     }
 #endif // NCNN_BATCH
 
+    bool use_radish_norm_alias = false;
+#if NCNN_STRING
+    const char* norm_outplace = getenv("RADISH_NCNN_NORM_OUTPLACE");
+    const char* norm_sum4 = getenv("RADISH_NCNN_NORM_SUM4");
+    const char* norm_alias = getenv("RADISH_NCNN_RESHAPE_ALIAS");
+    use_radish_norm_alias = norm_outplace && strcmp(norm_outplace, "1") == 0
+                            && norm_sum4 && strcmp(norm_sum4, "1") == 0
+                            && norm_alias && strcmp(norm_alias, "1") == 0
+                            && radish_norm_to3d_name(name)
+                            && vkdev->info.vendor_id() == 0x5143 && vkdev->info.device_id() == 506
+                            && strcmp(vkdev->info.device_name(), "Radish Adreno 506 (experimental compute)") == 0
+                            && opt.use_vulkan_compute && opt.use_packing_layout
+                            && !opt.use_fp16_packed && !opt.use_fp16_storage
+                            && !opt.use_fp16_arithmetic && !opt.use_fp16_uniform
+                            && !opt.use_bf16_packed && !opt.use_bf16_storage
+                            && !opt.use_int8_inference && !opt.use_int8_packed && !opt.use_int8_storage
+                            && !opt.use_int8_arithmetic && !opt.use_int8_uniform
+                            && !opt.use_int16_packed && !opt.use_int16_storage
+                            && !opt.use_subgroup_ops && !opt.use_shader_local_memory
+                            && !opt.use_cooperative_matrix && !opt.use_tensor_storage
+                            && dims == 2 && ndim == 3 && bottom_blob.n == 1
+                            && bottom_blob.d == 1 && bottom_blob.c == 1 && elempack == 4 && elemsize == 16u
+                            && (bottom_blob.h == 32 || bottom_blob.h == 64 || bottom_blob.h == 128 || bottom_blob.h == 256);
+    if (use_radish_norm_alias && (bottom_blob.w <= 0
+        || bottom_blob.w > std::numeric_limits<int>::max() / 4 / bottom_blob.h))
+        return -1;
+#endif
+
     int total = bottom_blob.w * bottom_blob.h * bottom_blob.d * bottom_blob.c * elempack;
 
     // resolve out shape
@@ -448,6 +495,93 @@ int Reshape_vulkan::forward(const std::vector<VkMat>& bottom_blobs, std::vector<
     }
 
     size_t out_elemsize = elemsize / elempack * out_elempack;
+
+    if (use_radish_norm_alias && outw == bottom_blob.w && outh == 1 && outc == bottom_blob.h * 4
+        && out_elempack == 4 && out_elemsize == 16u
+        && bottom_shapes.size() == 1 && top_shapes.size() == 1
+        && opt.blob_vkallocator && opt.blob_vkallocator->vkdev == vkdev
+        && bottom_blob.allocator == opt.blob_vkallocator
+        && bottom_blob.data && bottom_blob.data->buffer && bottom_blob.refcount && *bottom_blob.refcount > 0)
+    {
+        const Mat& input_shape = bottom_shapes[0];
+        const Mat& output_shape = top_shapes[0];
+        const size_t width = bottom_blob.w;
+        const size_t packs = bottom_blob.h;
+        const size_t max_size = std::numeric_limits<size_t>::max();
+        if (input_shape.dims == 2 && input_shape.n == 1 && input_shape.w == outw
+            && input_shape.h == (int)packs && input_shape.d == 1 && input_shape.c == 1
+            && input_shape.elempack == 4 && input_shape.elemsize == 16u
+            && output_shape.dims == 3 && output_shape.n == 1 && output_shape.w == outw
+            && output_shape.h == 1 && output_shape.d == 1 && output_shape.c == (int)packs
+            && output_shape.elempack == 4 && output_shape.elemsize == 16u && output_shape.cstep == width
+            && width <= max_size / packs)
+        {
+            const size_t count = width * packs;
+            if (count <= max_size / 16u && input_shape.cstep == count
+                && bottom_blob.cstep == count && bottom_blob.total() == count
+#if NCNN_BATCH
+                && bottom_blob.nstep == count
+#endif
+                && bottom_blob.offset <= bottom_blob.data->capacity
+                && count * 16u <= bottom_blob.data->capacity - bottom_blob.offset
+                && bottom_blob.buffer_capacity() == count * 16u
+                && bottom_blob.data->offset <= max_size - bottom_blob.offset)
+            {
+                const size_t offset = bottom_blob.buffer_offset();
+                const size_t alignment = vkdev->info.physicalDeviceProperties().limits.minStorageBufferOffsetAlignment;
+                if (offset % 16u == 0 && (!alignment || offset % alignment == 0)
+                    && count * 16u <= max_size - offset
+                    && count * 16u <= vkdev->info.physicalDeviceProperties().limits.maxStorageBufferRange)
+                {
+                    top_blob = bottom_blob;
+                    top_blob.dims = 3;
+                    top_blob.h = 1;
+                    top_blob.c = (int)packs;
+                    top_blob.cstep = width;
+                    return 0;
+                }
+            }
+        }
+    }
+
+    const char* alias_env = getenv("RADISH_NCNN_RESHAPE_ALIAS");
+    if (alias_env && strcmp(alias_env, "1") == 0
+        && vkdev->info.vendor_id() == 0x5143 && vkdev->info.device_id() == 506
+        && strcmp(vkdev->info.device_name(), "Radish Adreno 506 (experimental compute)") == 0
+        && opt.use_packing_layout && !opt.use_fp16_packed && !opt.use_fp16_storage
+        && !opt.use_fp16_arithmetic && !opt.use_fp16_uniform
+        && !opt.use_bf16_packed && !opt.use_bf16_storage
+        && elempack == 4 && out_elempack == 4 && elemsize == 16 && out_elemsize == 16
+        && bottom_blob.data && bottom_blob.refcount && bottom_blob.n == 1
+        && bottom_blob.w > 0 && bottom_blob.d == 1 && outw == bottom_blob.w
+        && dims == 3 && ndim == 2 && bottom_blob.h == 1 && bottom_blob.c > 0
+        && outh > 0 && outh % 4 == 0 && outh / 4 == bottom_blob.c
+        && bottom_blob.allocator == opt.blob_vkallocator)
+    {
+        const size_t width = bottom_blob.w;
+        const size_t packs = bottom_blob.c;
+        if (width <= std::numeric_limits<size_t>::max() / packs)
+        {
+            const size_t count = width * packs;
+            if (count <= std::numeric_limits<size_t>::max() / elemsize
+                && bottom_blob.cstep == width
+                && bottom_blob.total() == count
+#if NCNN_BATCH
+                && bottom_blob.nstep == count
+#endif
+                && bottom_blob.offset <= bottom_blob.data->capacity
+                && count * elemsize <= bottom_blob.data->capacity - bottom_blob.offset
+                && bottom_blob.buffer_capacity() == count * elemsize)
+            {
+                top_blob = bottom_blob;
+                top_blob.dims = 2;
+                top_blob.h = (int)packs;
+                top_blob.c = 1;
+                top_blob.cstep = count;
+                return 0;
+            }
+        }
+    }
 
     if (ndim == 1)
     {

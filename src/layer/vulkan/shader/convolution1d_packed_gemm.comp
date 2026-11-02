@@ -49,6 +49,7 @@ layout(push_constant) uniform parameter
 } p;
 
 #if NCNN_shader_local_memory
+layout(constant_id = shape_constant_id_offset + 6) const int shared32_mode = 0;
 shared lfpvec4 tmp_v[8][LOCAL_MEMORY_UNROLL_INCH][4];
 shared lfpvec4 tmp_k[8][LOCAL_MEMORY_UNROLL_INCH][4];
 #endif
@@ -59,6 +60,10 @@ void main()
     int gy = int(gl_GlobalInvocationID.y);
 
     const int outsize = psc(outw);
+
+#if NCNN_shader_local_memory
+    const bool shared32 = shared32_mode != 0;
+#endif
 
 #if !NCNN_shader_local_memory
     if (gx >= outsize || gy >= psc(outh))
@@ -72,7 +77,13 @@ void main()
 
     if (bias_term == 1)
     {
+#if NCNN_shader_local_memory
+        afpvec4 b = afpvec4(0.f);
+        if (!shared32 || gy < psc(outh))
+            b = buffer_ld4(bias_data, gy);
+#else
         afpvec4 b = buffer_ld4(bias_data, gy);
+#endif
         sum0 = b;
         sum1 = b;
         sum2 = b;
@@ -111,7 +122,11 @@ void main()
 
                 const int kx = k % kernel_w;
 
-                if (elempack == 4)
+                if (shared32 && gx + ly >= outsize)
+                {
+                    tmp_v[lx][z4][ly] = afp2lfpvec4(afpvec4(0.f));
+                }
+                else if (elempack == 4)
                 {
                     const int v_offset = sz * psc(w) + sx4[ly] + kx * dilation_w;
                     tmp_v[lx][z4][ly] = buffer_sm4(bottom_blob_data_4, v_offset);
@@ -135,7 +150,10 @@ void main()
         {
             for (int z4 = 0; z4 < LOCAL_MEMORY_UNROLL_INCH; z4++)
             {
-                tmp_k[ly][z4][lx] = buffer_sm4(weight_data, w_offset + z4 * 4 + lx);
+                if (shared32 && gy >= psc(outh))
+                    tmp_k[ly][z4][lx] = afp2lfpvec4(afpvec4(0.f));
+                else
+                    tmp_k[ly][z4][lx] = buffer_sm4(weight_data, w_offset + z4 * 4 + lx);
             }
         }
 
@@ -179,7 +197,11 @@ void main()
 
                 const int kx = k % kernel_w;
 
-                if (elempack == 4)
+                if (shared32 && gx + ly >= outsize)
+                {
+                    tmp_v[lx][z4][ly] = afp2lfpvec4(afpvec4(0.f));
+                }
+                else if (elempack == 4)
                 {
                     const int v_offset = sz * psc(w) + sx4[ly] + kx * dilation_w;
                     tmp_v[lx][z4][ly] = buffer_sm4(bottom_blob_data_4, v_offset);
@@ -203,7 +225,10 @@ void main()
         {
             for (int z4 = 0; z4 < remain; z4++)
             {
-                tmp_k[ly][z4][lx] = buffer_sm4(weight_data, w_offset + z4 * 4 + lx);
+                if (shared32 && gy >= psc(outh))
+                    tmp_k[ly][z4][lx] = afp2lfpvec4(afpvec4(0.f));
+                else
+                    tmp_k[ly][z4][lx] = buffer_sm4(weight_data, w_offset + z4 * 4 + lx);
             }
         }
 
@@ -230,12 +255,18 @@ void main()
         }
     }
 #else
+#if !(NCNN_fp16_arithmetic || NCNN_fp16_storage || NCNN_fp16_packed || NCNN_bf16_storage || NCNN_bf16_packed)
+    int sz = 0;
+    int kx = 0;
+#endif
     for (int z = 0; z < N; z++)
     {
+#if NCNN_fp16_arithmetic || NCNN_fp16_storage || NCNN_fp16_packed || NCNN_bf16_storage || NCNN_bf16_packed
         const int sz = z / maxk;
         const int kk = z % maxk;
 
         const int kx = kk % kernel_w;
+#endif
 
         afpvec4 v0, v1, v2, v3;
 
@@ -291,6 +322,14 @@ void main()
         sum3 += v3 * k;
 
         w_offset += 4;
+#if !(NCNN_fp16_arithmetic || NCNN_fp16_storage || NCNN_fp16_packed || NCNN_bf16_storage || NCNN_bf16_packed)
+        kx++;
+        if (kx == maxk)
+        {
+            kx = 0;
+            sz++;
+        }
+#endif
     }
 #endif
 

@@ -12,6 +12,7 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #if NCNN_BENCHMARK
@@ -24,6 +25,25 @@
 #endif // NCNN_VULKAN
 
 namespace ncnn {
+
+// Opt-in execution evidence without timestamp-query support. Dispatch counts
+// are workgroups recorded by a layer, not completed GPU timings.
+static bool radish_trace_enabled()
+{
+    const char* value = getenv("RADISH_NCNN_TRACE");
+    return value && value[0] && strcmp(value, "0") != 0;
+}
+
+static void radish_trace_layer(int index, const Layer* layer, const char* path, int ret, uint64_t dispatch_groups)
+{
+    if (!radish_trace_enabled())
+        return;
+#if NCNN_STRING
+    NCNN_LOGE("RADISH_TRACE layer=%d type=%s name=%s path=%s ret=%d dispatch_groups=%llu", index, layer->type.c_str(), layer->name.c_str(), path, ret, (unsigned long long)dispatch_groups);
+#else
+    NCNN_LOGE("RADISH_TRACE layer=%d typeindex=%d path=%s ret=%d dispatch_groups=%llu", index, layer->typeindex, path, ret, (unsigned long long)dispatch_groups);
+#endif
+}
 
 #if NCNN_VALIDATION
 // bound model header allocations, including repeated blob references
@@ -135,6 +155,23 @@ static Option get_masked_option(const Option& opt, int featmask)
     return opt1;
 }
 
+#if NCNN_VULKAN
+static bool radish_mixed_storage_enabled(const VulkanDevice* vkdev, const Option& opt)
+{
+    const char* value = getenv("RADISH_NCNN_MIXED_STORAGE");
+    return value && strcmp(value, "1") == 0
+           && vkdev->info.vendor_id() == 0x5143 && vkdev->info.device_id() == 506
+           && strcmp(vkdev->info.device_name(), "Radish Adreno 506 (experimental compute)") == 0
+           && !vkdev->info.support_fp16_storage()
+           && opt.use_vulkan_compute && opt.use_fp16_packed
+           && !opt.use_fp16_storage && !opt.use_fp16_arithmetic && !opt.use_fp16_uniform
+           && !opt.use_bf16_packed && !opt.use_bf16_storage
+           && !opt.use_int8_inference && !opt.use_int8_packed && !opt.use_int8_storage
+           && !opt.use_int8_arithmetic && !opt.use_int8_uniform
+           && !opt.use_int16_packed && !opt.use_int16_storage && !opt.use_tensor_storage;
+}
+#endif
+
 int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, const Option& opt) const
 {
     if (layer_index < 0 || layer_index >= (int)layers.size() || !layers[layer_index])
@@ -187,6 +224,7 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, cons
     {
         ret = do_forward_layer(layer, blob_mats, opt);
     }
+    radish_trace_layer(layer_index, layer, "CPU", ret, 0);
 #if NCNN_BENCHMARK
     double end = get_current_time();
     if (layer->one_blob_only)
@@ -244,7 +282,11 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std:
             if (blob_mats_gpu[bottom_blob_index].dims == 0 && blob_mats[bottom_blob_index].dims != 0)
             {
                 // host to buffer
-                cmd.record_upload(blob_mats[bottom_blob_index], blob_mats_gpu[bottom_blob_index], opt);
+                if (radish_trace_enabled())
+                    NCNN_LOGE("RADISH_TRACE event=upload consumer=%d blob=%d storage_bytes=%zu", layer_index, bottom_blob_index, blob_mats[bottom_blob_index].total() * blob_mats[bottom_blob_index].elemsize);
+                const Option opt_upload = radish_mixed_storage_enabled(vkdev, this->opt)
+                                              ? get_masked_option(opt, layer->featmask) : opt;
+                cmd.record_upload(blob_mats[bottom_blob_index], blob_mats_gpu[bottom_blob_index], opt_upload);
 
                 if (opt.lightmode)
                 {
@@ -261,6 +303,8 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std:
                 opt_download.use_packing_layout = layer->support_packing;
 
                 // buffer to host
+                if (radish_trace_enabled())
+                    NCNN_LOGE("RADISH_TRACE event=download consumer=%d blob=%d storage_bytes=%zu", layer_index, bottom_blob_index, blob_mats_gpu[bottom_blob_index].total() * blob_mats_gpu[bottom_blob_index].elemsize);
                 cmd.record_download(blob_mats_gpu[bottom_blob_index], blob_mats[bottom_blob_index], opt_download);
 
                 if (opt.lightmode)
@@ -302,7 +346,11 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std:
     int ret;
     if (cmd_submit_and_wait)
     {
+        if (radish_trace_enabled())
+            NCNN_LOGE("RADISH_TRACE event=submit layer=%d pending_dispatch_groups=%llu", layer_index, (unsigned long long)cmd.pending_dispatch_total());
         ret = cmd.submit_and_wait();
+        if (radish_trace_enabled())
+            NCNN_LOGE("RADISH_TRACE event=submit_done layer=%d ret=%d", layer_index, ret);
 
 #if NCNN_BENCHMARK
         std::vector<uint64_t> results(layer_index * 2);
@@ -320,10 +368,13 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std:
 #endif // NCNN_BENCHMARK
 
         cmd.reset();
+        if (radish_trace_enabled())
+            NCNN_LOGE("RADISH_TRACE event=reset layer=%d", layer_index);
         if (ret != 0)
             return ret;
     }
 
+    const uint64_t dispatch_before_layer = cmd.pending_dispatch_total();
     if (layer->support_vulkan)
     {
 #if NCNN_BENCHMARK
@@ -373,6 +424,7 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std:
         }
 #endif
     }
+    radish_trace_layer(layer_index, layer, layer->support_vulkan ? "GPU" : "CPU", ret, cmd.pending_dispatch_total() - dispatch_before_layer);
     if (ret != 0)
         return ret;
 
@@ -655,14 +707,26 @@ int NetPrivate::convert_layout(VkMat& bottom_blob, const Layer* layer, VkCompute
         }
     }
 
-    if (bottom_blob.elempack != dst_elempack)
+    int cast_type_to = 0;
+    int dst_elembits = bottom_blob.elembits();
+    if (radish_mixed_storage_enabled(vkdev, this->opt))
+    {
+        if (dst_elembits != 16 && dst_elembits != 32)
+            return -1;
+        cast_type_to = opt.use_fp16_packed ? 2 : 1;
+        dst_elembits = opt.use_fp16_packed ? 16 : 32;
+    }
+
+    if (bottom_blob.elempack != dst_elempack || bottom_blob.elembits() != dst_elembits)
     {
         VkMat bottom_blob_packed;
-        vkdev->convert_packing(bottom_blob, bottom_blob_packed, dst_elempack, cmd, opt);
+        vkdev->convert_packing(bottom_blob, bottom_blob_packed, dst_elempack, cast_type_to, cmd, opt);
         bottom_blob = bottom_blob_packed;
 
         if (bottom_blob.empty())
             return -100;
+        if (cast_type_to && bottom_blob.elembits() != dst_elembits)
+            return -1;
     }
 
     return 0;

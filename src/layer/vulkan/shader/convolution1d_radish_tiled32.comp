@@ -1,0 +1,105 @@
+#version 450
+
+// FP32 implicit GEMM: 32 output channels x 32 positions, reduction blocks of
+// 32, eight vec4 accumulators per invocation. Host local size is 8x4x1.
+layout(constant_id = 0) const int kernel_w = 1;
+layout(constant_id = 1) const int num_input = 32;
+layout(constant_id = 2) const int num_output = 64;
+layout(constant_id = 3) const int bias_term = 0;
+layout(constant_id = 4) const int dilation_w = 1;
+
+layout(binding = 0) readonly buffer weights { vec4 weight_data[]; };
+layout(binding = 1) readonly buffer bottom_blob { float bottom_blob_data[]; };
+layout(binding = 2) writeonly buffer top_blob { vec4 top_blob_data[]; };
+layout(binding = 3) readonly buffer bias_blob { float bias_data[]; };
+
+layout(push_constant) uniform parameter
+{
+    int w;
+    int outw;
+} p;
+
+// Exactly 8 KiB; every invocation reaches both barriers in each K block.
+shared float sa[32][32];
+shared vec4 sb[32][8];
+
+vec4 load_input(int k, int x)
+{
+    const int ci = k / kernel_w;
+    const int tap = (k - ci * kernel_w) * dilation_w;
+    const int base = (ci / 4) * p.w * 4 + ci % 4;
+    vec4 v = vec4(0.f);
+    if (x < p.outw) v.x = bottom_blob_data[base + (x + tap) * 4];
+    if (x + 1 < p.outw) v.y = bottom_blob_data[base + (x + 1 + tap) * 4];
+    if (x + 2 < p.outw) v.z = bottom_blob_data[base + (x + 2 + tap) * 4];
+    if (x + 3 < p.outw) v.w = bottom_blob_data[base + (x + 3 + tap) * 4];
+    return v;
+}
+
+void main()
+{
+    const int tx = int(gl_LocalInvocationID.x);
+    const int ty = int(gl_LocalInvocationID.y);
+    const int tid = ty * 8 + tx;
+    const int mb = int(gl_WorkGroupID.y) * 32;
+    const int nb = int(gl_WorkGroupID.x) * 32;
+    const int K = num_input * kernel_w;
+    const int K4 = K / 4;
+
+    vec4 acc[8];
+    for (int r = 0; r < 8; r++)
+    {
+        const int co = mb + ty * 8 + r;
+        acc[r] = vec4(bias_term != 0 && co < num_output ? bias_data[co] : 0.f);
+    }
+
+    for (int k0 = 0; k0 < K; k0 += 32)
+    {
+        for (int i = tid; i < 32 * 8; i += 32)
+        {
+            const int r = i / 8;
+            const int q = i % 8;
+            vec4 a = mb + r < num_output ? weight_data[(mb + r) * K4 + k0 / 4 + q] : vec4(0.f);
+            sa[q * 4][r] = a.x;
+            sa[q * 4 + 1][r] = a.y;
+            sa[q * 4 + 2][r] = a.z;
+            sa[q * 4 + 3][r] = a.w;
+        }
+        for (int i = tid; i < 32 * 8; i += 32)
+        {
+            const int r = i / 8;
+            const int q = i % 8;
+            sb[r][q] = load_input(k0 + r, nb + q * 4);
+        }
+        barrier();
+
+        for (int k = 0; k < 32; k++)
+        {
+            vec4 b = sb[k][tx];
+            for (int r = 0; r < 8; r++)
+            {
+                float a = sa[k][ty * 8 + r];
+                acc[r] += a * b;
+            }
+        }
+        barrier();
+    }
+
+    // Transpose four channel rows into ncnn's pack4 at each spatial position.
+    const int x = nb + tx * 4;
+    for (int r = 0; r < 8; r += 4)
+    {
+        const int co = mb + ty * 8 + r;
+        if (co + 3 >= num_output)
+            continue;
+        const int base = (co / 4) * p.outw + x;
+        if (x < p.outw)
+            top_blob_data[base] = vec4(acc[r].x, acc[r + 1].x, acc[r + 2].x, acc[r + 3].x);
+        if (x + 1 < p.outw)
+            top_blob_data[base + 1] = vec4(acc[r].y, acc[r + 1].y, acc[r + 2].y, acc[r + 3].y);
+        if (x + 2 < p.outw)
+            top_blob_data[base + 2] = vec4(acc[r].z, acc[r + 1].z, acc[r + 2].z, acc[r + 3].z);
+        if (x + 3 < p.outw)
+            top_blob_data[base + 3] = vec4(acc[r].w, acc[r + 1].w, acc[r + 2].w, acc[r + 3].w);
+    }
+}

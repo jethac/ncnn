@@ -20,14 +20,13 @@ Reduction_vulkan::Reduction_vulkan()
 
 int Reduction_vulkan::create_pipeline(const Option& opt)
 {
-    std::vector<vk_specialization_type> specializations(1);
+    std::vector<vk_specialization_type> specializations(2);
     specializations[0].i = operation;
+    specializations[1].i = opt.use_subgroup_ops ? 256 : 32;
 
     pipeline_reduction = new Pipeline(vkdev);
-    pipeline_reduction->set_local_size_xyz(256, 1, 1);
-    pipeline_reduction->create(LayerShaderType::reduction, opt, specializations);
-
-    return 0;
+    pipeline_reduction->set_local_size_xyz(specializations[1].i, 1, 1);
+    return pipeline_reduction->create(LayerShaderType::reduction, opt, specializations);
 }
 
 int Reduction_vulkan::destroy_pipeline(const Option& /*opt*/)
@@ -189,7 +188,7 @@ int Reduction_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompu
     int out_total = outw * outh * outd * outc;
 
     VkMat dispatcher;
-    dispatcher.w = 256;
+    dispatcher.w = pipeline_reduction->local_size_x();
     dispatcher.h = out_total;
     dispatcher.c = 1;
 
