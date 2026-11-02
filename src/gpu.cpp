@@ -3753,6 +3753,7 @@ public:
     void destroy_utility_operator();
 
     VkDevice device;
+    bool robust_buffer_access;
 
     // hardware queue
     mutable std::vector<VkQueue> compute_queues;
@@ -3810,6 +3811,7 @@ VulkanDevicePrivate::VulkanDevicePrivate(VulkanDevice* _vkdev)
     : vkdev(_vkdev)
 {
     device = 0;
+    robust_buffer_access = false;
     texelfetch_sampler = 0;
     dummy_allocator = 0;
     pipeline_cache = 0;
@@ -4077,9 +4079,23 @@ void VulkanDevicePrivate::destroy_utility_operator()
 }
 
 VulkanDevice::VulkanDevice(int device_index)
+    : VulkanDevice(device_index, true)
+{
+}
+
+VulkanDevice::VulkanDevice(int device_index, bool enable_robust_buffer_access)
     : info(get_gpu_info(device_index)), d(new VulkanDevicePrivate(this))
 {
     try_create_gpu_instance();
+
+    if (!enable_robust_buffer_access && info.queryRobustness2Features().robustBufferAccess2)
+    {
+        NCNN_LOGE("VulkanDevice cannot disable robustBufferAccess while robustBufferAccess2 is enabled");
+        return;
+    }
+    VkPhysicalDeviceFeatures enabledFeatures = info.physicalDevicefeatures();
+    if (!enable_robust_buffer_access)
+        enabledFeatures.robustBufferAccess = VK_FALSE;
 
     std::vector<const char*> enabledExtensions;
     if (info.support_VK_KHR_8bit_storage())
@@ -4229,7 +4245,7 @@ VulkanDevice::VulkanDevice(int device_index)
     deviceCreateInfo.ppEnabledLayerNames = 0;
     deviceCreateInfo.enabledExtensionCount = enabledExtensions.size();
     deviceCreateInfo.ppEnabledExtensionNames = enabledExtensions.data();
-    deviceCreateInfo.pEnabledFeatures = &info.physicalDevicefeatures();
+    deviceCreateInfo.pEnabledFeatures = &enabledFeatures;
 
     VkResult ret = vkCreateDevice(info.physicalDevice(), &deviceCreateInfo, 0, &d->device);
     if (ret != VK_SUCCESS)
@@ -4237,6 +4253,8 @@ VulkanDevice::VulkanDevice(int device_index)
         NCNN_LOGE("vkCreateDevice failed %d", ret);
         return;
     }
+
+    d->robust_buffer_access = enabledFeatures.robustBufferAccess == VK_TRUE;
 
     init_device_extension();
 
@@ -4374,6 +4392,11 @@ VkDevice VulkanDevice::vkdevice() const
 bool VulkanDevice::is_valid() const
 {
     return d->valid;
+}
+
+bool VulkanDevice::enabled_robust_buffer_access() const
+{
+    return d->robust_buffer_access;
 }
 
 VkShaderModule VulkanDevice::compile_shader_module(const uint32_t* spv_data, size_t spv_data_size) const

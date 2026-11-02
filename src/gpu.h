@@ -445,12 +445,14 @@ class NCNN_EXPORT VulkanDevice
 {
 public:
     VulkanDevice(int device_index = get_default_gpu_index());
+    VulkanDevice(int device_index, bool enable_robust_buffer_access);
     ~VulkanDevice();
 
     const GpuInfo& info;
 
     VkDevice vkdevice() const;
     bool is_valid() const;
+    bool enabled_robust_buffer_access() const;
 
 #if NCNN_COVERAGE
     void bind_shader_coverage(VkCommandBuffer command_buffer, VkPipelineLayout pipeline_layout) const;
