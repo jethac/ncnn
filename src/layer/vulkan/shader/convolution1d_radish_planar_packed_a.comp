@@ -54,7 +54,7 @@ void main()
         {
             const int r = i >> 4;
             const int q = i % 16;
-            vec4 a = mb + q * 4 + 3 < num_output ? weight_data[(k0 + r) * (num_output / 4) + (mb / 4) + q] : vec4(0.f);
+            vec4 a = mb + q * 4 + 3 < num_output ? weight_data[(k0 + r) * (num_output / 4) + (mb >> 2) + q] : vec4(0.f);
             sa[r][q * 4] = a.x;
             sa[r][q * 4 + 1] = a.y;
             sa[r][q * 4 + 2] = a.z;
