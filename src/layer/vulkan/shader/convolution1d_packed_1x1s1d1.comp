@@ -51,8 +51,8 @@ void main()
     if (gx >= psc(outw) || gy >= psc(outh))
         return;
 
-    const ivec2 gx2 = gx + ivec2(0, 1);
-    const ivec2 gy2 = gy + ivec2(0, 1);
+    const ivec2 gx2 = gx + ivec2(0, gx + 1 < psc(outw) ? 1 : 0);
+    const ivec2 gy2 = gy + ivec2(0, gy + 1 < psc(outh) ? 1 : 0);
 
     afpvec4 sum0;
     afpvec4 sum1;

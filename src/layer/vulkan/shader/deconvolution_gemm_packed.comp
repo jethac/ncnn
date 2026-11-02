@@ -192,9 +192,9 @@ void main()
         if (elempack == 4)
         {
             v0 = buffer_ld4(bottom_blob_data_4, v_offset + 0);
-            v1 = buffer_ld4(bottom_blob_data_4, v_offset + 1);
-            v2 = buffer_ld4(bottom_blob_data_4, v_offset + 2);
-            v3 = buffer_ld4(bottom_blob_data_4, v_offset + 3);
+            v1 = gx + 1 < psc(outcstep) ? buffer_ld4(bottom_blob_data_4, v_offset + 1) : afpvec4(0.f);
+            v2 = gx + 2 < psc(outcstep) ? buffer_ld4(bottom_blob_data_4, v_offset + 2) : afpvec4(0.f);
+            v3 = gx + 3 < psc(outcstep) ? buffer_ld4(bottom_blob_data_4, v_offset + 3) : afpvec4(0.f);
         }
         else // elempack == 1
         {
