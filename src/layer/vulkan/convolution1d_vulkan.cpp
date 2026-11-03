@@ -360,6 +360,7 @@ int Convolution1D_vulkan::create_pipeline(const Option& _opt)
     const char* wino_env = getenv("RADISH_NCNN_WINOGRAD");
     use_radish_wino = wino_env && strcmp(wino_env, "1") == 0 && radish_gemm_available(vkdev, opt)
                       && stride_w == 1 && (kernel_w == 3 || kernel_w == 7 || kernel_w == 11)
+                      && num_input >= 128 && num_output >= 128 // narrower: transforms and padding cost more than they save
                       && elempack == 4 && out_elempack == 4 && activation_type == 0 && !dynamic_weight
                       && (long long)num_input * kernel_w * num_output == weight_data_size;
     if (use_radish_wino)
