@@ -10,6 +10,9 @@
 
 namespace ncnn {
 
+static uint64_t g_dispatch_sequence = 0;
+
+
 class VkComputePrivate
 {
 public:
@@ -1618,6 +1621,7 @@ void VkCompute::record_pipeline(const Pipeline* pipeline, const std::vector<VkMa
         }
 
         d->pending_dispatch_total += group_count_x * group_count_y * group_count_z;
+        __atomic_fetch_add(&g_dispatch_sequence, 1, __ATOMIC_RELAXED);
     }
 }
 
@@ -2155,6 +2159,11 @@ int VkCompute::reset()
     }
 
     return 0;
+}
+
+uint64_t VkCompute::dispatch_sequence()
+{
+    return __atomic_load_n(&g_dispatch_sequence, __ATOMIC_RELAXED);
 }
 
 uint64_t VkCompute::pending_dispatch_total() const

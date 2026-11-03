@@ -70,6 +70,9 @@ public:
 
     uint64_t pending_dispatch_total() const;
 
+    // process-wide count of recorded vkCmdDispatch calls, in recording order
+    static uint64_t dispatch_sequence();
+
 #if NCNN_BENCHMARK
     int create_query_pool(uint32_t query_count);
 

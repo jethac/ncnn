@@ -13,6 +13,7 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <time.h>
 #include <string.h>
 
 #if NCNN_BENCHMARK
@@ -34,14 +35,33 @@ static bool radish_trace_enabled()
     return value && value[0] && strcmp(value, "0") != 0;
 }
 
-static void radish_trace_layer(int index, const Layer* layer, const char* path, int ret, uint64_t dispatch_groups)
+static long long radish_trace_now_ns()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+static unsigned long long radish_trace_dispatch_sequence()
+{
+#if NCNN_VULKAN
+    return (unsigned long long)VkCompute::dispatch_sequence();
+#else
+    return 0;
+#endif
+}
+
+// record_ns is host time spent in the layer's forward call (recording for GPU
+// layers, execution for CPU layers); dispatch_end is the process-wide dispatch
+// sequence after the layer, for joining with the driver's RADISH_TRACE file.
+static void radish_trace_layer(int index, const Layer* layer, const char* path, int ret, uint64_t dispatch_groups, long long record_ns = 0)
 {
     if (!radish_trace_enabled())
         return;
 #if NCNN_STRING
-    NCNN_LOGE("RADISH_TRACE layer=%d type=%s name=%s path=%s ret=%d dispatch_groups=%llu", index, layer->type.c_str(), layer->name.c_str(), path, ret, (unsigned long long)dispatch_groups);
+    NCNN_LOGE("RADISH_TRACE layer=%d type=%s name=%s path=%s ret=%d dispatch_groups=%llu dispatch_end=%llu record_ns=%lld t=%lld", index, layer->type.c_str(), layer->name.c_str(), path, ret, (unsigned long long)dispatch_groups, radish_trace_dispatch_sequence(), record_ns, radish_trace_now_ns());
 #else
-    NCNN_LOGE("RADISH_TRACE layer=%d typeindex=%d path=%s ret=%d dispatch_groups=%llu", index, layer->typeindex, path, ret, (unsigned long long)dispatch_groups);
+    NCNN_LOGE("RADISH_TRACE layer=%d typeindex=%d path=%s ret=%d dispatch_groups=%llu dispatch_end=%llu record_ns=%lld t=%lld", index, layer->typeindex, path, ret, (unsigned long long)dispatch_groups, radish_trace_dispatch_sequence(), record_ns, radish_trace_now_ns());
 #endif
 }
 
@@ -347,10 +367,10 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std:
     if (cmd_submit_and_wait)
     {
         if (radish_trace_enabled())
-            NCNN_LOGE("RADISH_TRACE event=submit layer=%d pending_dispatch_groups=%llu", layer_index, (unsigned long long)cmd.pending_dispatch_total());
+            NCNN_LOGE("RADISH_TRACE event=submit layer=%d pending_dispatch_groups=%llu dispatch_seq=%llu t=%lld", layer_index, (unsigned long long)cmd.pending_dispatch_total(), radish_trace_dispatch_sequence(), radish_trace_now_ns());
         ret = cmd.submit_and_wait();
         if (radish_trace_enabled())
-            NCNN_LOGE("RADISH_TRACE event=submit_done layer=%d ret=%d", layer_index, ret);
+            NCNN_LOGE("RADISH_TRACE event=submit_done layer=%d ret=%d t=%lld", layer_index, ret, radish_trace_now_ns());
 
 #if NCNN_BENCHMARK
         std::vector<uint64_t> results(layer_index * 2);
@@ -375,6 +395,7 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std:
     }
 
     const uint64_t dispatch_before_layer = cmd.pending_dispatch_total();
+    const long long record_start_ns = radish_trace_enabled() ? radish_trace_now_ns() : 0;
     if (layer->support_vulkan)
     {
 #if NCNN_BENCHMARK
@@ -424,7 +445,8 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std:
         }
 #endif
     }
-    radish_trace_layer(layer_index, layer, layer->support_vulkan ? "GPU" : "CPU", ret, cmd.pending_dispatch_total() - dispatch_before_layer);
+    radish_trace_layer(layer_index, layer, layer->support_vulkan ? "GPU" : "CPU", ret, cmd.pending_dispatch_total() - dispatch_before_layer,
+                       record_start_ns ? radish_trace_now_ns() - record_start_ns : 0);
     if (ret != 0)
         return ret;
 

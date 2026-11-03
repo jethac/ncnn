@@ -5413,7 +5413,11 @@ VulkanDevice* get_gpu_device(int device_index)
     MutexLockGuard lock(g_default_vkdev_lock);
 
     if (!g_default_vkdev[device_index])
-        g_default_vkdev[device_index] = new VulkanDevice(device_index);
+    {
+        // RADISH_NCNN_ROBUST=0 creates the default device without robustBufferAccess
+        const char* robust = getenv("RADISH_NCNN_ROBUST");
+        g_default_vkdev[device_index] = new VulkanDevice(device_index, !(robust && strcmp(robust, "0") == 0));
+    }
 
     return g_default_vkdev[device_index];
 }
