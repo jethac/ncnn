@@ -5414,9 +5414,10 @@ VulkanDevice* get_gpu_device(int device_index)
 
     if (!g_default_vkdev[device_index])
     {
-        // RADISH_NCNN_ROBUST=0 creates the default device without robustBufferAccess
+        // radish: the default device is created without robustBufferAccess;
+        // RADISH_NCNN_ROBUST=1 opts back in (bounds-checked shaders).
         const char* robust = getenv("RADISH_NCNN_ROBUST");
-        g_default_vkdev[device_index] = new VulkanDevice(device_index, !(robust && strcmp(robust, "0") == 0));
+        g_default_vkdev[device_index] = new VulkanDevice(device_index, robust && strcmp(robust, "1") == 0);
     }
 
     return g_default_vkdev[device_index];
