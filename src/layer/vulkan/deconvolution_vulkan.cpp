@@ -201,11 +201,14 @@ int Deconvolution_vulkan::create_pipeline(const Option& opt)
                         a[(size_t)m * Kp + ci] = weight_data_r2.channel(co).row(ci)[k];
                 }
             }
-            std::vector<vk_specialization_type> specializations(4);
+            std::vector<vk_specialization_type> specializations(7);
             specializations[0].i = num_input;
             specializations[1].i = Kp;
             specializations[2].i = 4;
             specializations[3].i = 0;
+            specializations[4].i = 1; // kw
+            specializations[5].i = 1; // dilation
+            specializations[6].i = 8; // rows per invocation (64-row tile)
             pipeline_deconvolution_gemm = new Pipeline(vkdev);
             pipeline_deconvolution_gemm->set_local_size_xyz(16, 8, 1);
             pipeline_deconvolution_gemm->create(LayerShaderType::convolution1d_radish_gemm, opt, specializations);

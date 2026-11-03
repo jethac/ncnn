@@ -14,6 +14,11 @@ layout(constant_id = 0) const int K = 32;
 layout(constant_id = 1) const int Kp = 32;
 layout(constant_id = 2) const int b_pack = 4;
 layout(constant_id = 3) const int bias_term = 0;
+// implicit-GEMM convolution: k = ci * kw + tap reads column n + tap * dil
+layout(constant_id = 4) const int kw = 1;
+layout(constant_id = 5) const int dil = 1;
+// rows per invocation: 8 (64-row tile) or 4 (32-row tile for narrow layers)
+layout(constant_id = 6) const int R = 8;
 
 layout(binding = 0) readonly buffer a_blob { vec4 a_data[]; };
 layout(binding = 1) readonly buffer b_blob { float b_data[]; };
@@ -36,9 +41,11 @@ float load_b(int k, int n)
 {
     if (k >= K || n >= p.N)
         return 0.f;
+    const int ci = k / kw;
+    const int pos = n + (k - ci * kw) * dil;
     if (b_pack == 4)
-        return b_data[((k / 4) * p.b_stride + n) * 4 + k % 4];
-    return b_data[k * p.b_stride + n];
+        return b_data[((ci / 4) * p.b_stride + pos) * 4 + ci % 4];
+    return b_data[ci * p.b_stride + pos];
 }
 
 void main()
@@ -46,20 +53,20 @@ void main()
     const int tx = int(gl_LocalInvocationID.x);
     const int ty = int(gl_LocalInvocationID.y);
     const int tid = ty * 16 + tx;
-    const int mb = int(gl_WorkGroupID.y) * 64;
+    const int mb = int(gl_WorkGroupID.y) * 8 * R;
     const int nb = int(gl_WorkGroupID.x) * 64;
     const int Kp4 = Kp / 4;
 
     vec4 acc[8];
-    for (int r = 0; r < 8; r++)
+    for (int r = 0; r < R; r++)
     {
-        const int m = mb + ty * 8 + r;
+        const int m = mb + ty * R + r;
         acc[r] = vec4(bias_term != 0 && m < p.M ? bias_data[m] : 0.f);
     }
 
     for (int k0 = 0; k0 < Kp; k0 += 32)
     {
-        for (int i = tid; i < 64 * 8; i += 128)
+        for (int i = tid; i < 8 * R * 8; i += 128)
         {
             const int r = i / 8;
             const int q = i % 8;
@@ -81,9 +88,9 @@ void main()
         for (int k = 0; k < 32; k++)
         {
             vec4 b = sb[k][tx];
-            for (int r = 0; r < 8; r++)
+            for (int r = 0; r < R; r++)
             {
-                float a = sa[k][ty * 8 + r];
+                float a = sa[k][ty * R + r];
                 acc[r] += a * b;
             }
         }
@@ -91,9 +98,9 @@ void main()
     }
 
     const int n = nb + tx * 4;
-    for (int r = 0; r < 8; r += 4)
+    for (int r = 0; r < R; r += 4)
     {
-        const int m = mb + ty * 8 + r;
+        const int m = mb + ty * R + r;
         if (m >= p.M)
             continue;
         const int base = (m / 4) * p.c_stride + n;

@@ -233,6 +233,7 @@ Convolution1D_vulkan::Convolution1D_vulkan()
 
     use_radish_tiled = false;
     use_radish_gemm = false;
+    radish_gemm_rows = 8;
     use_radish_wino = false;
     radish_tiled32 = false;
     radish_planar = false;
@@ -573,6 +574,38 @@ int Convolution1D_vulkan::create_pipeline(const Option& _opt)
                 return -1;
         }
     }
+    else if (is_conv1x1s1d1 && !dynamic_weight && out_elempack == 4 && activation_type == 0
+             && radish_gemm_available(vkdev, opt))
+    {
+        // radish: Conv1D as an implicit GEMM [num_output][num_input * kernel_w],
+        // 64-row tiles, or 32-row tiles for layers of at most 32 outputs.
+        // Only 1x1 here: for k > 1 on the 32/64-channel student layers the
+        // gathered B loads lose to ncnn's packed GEMM (student 3.47 -> 4.56 s).
+        use_radish_gemm = true;
+        radish_gemm_rows = num_output <= 32 ? 4 : 8;
+        const int K = num_input * kernel_w;
+        const int Mp = radish_gemm_round(num_output, 8 * radish_gemm_rows);
+        const int Kp = radish_gemm_round(K, 32);
+        weight_data_packed.create(Kp * Mp, (size_t)4u, 1);
+        if (weight_data_packed.empty())
+            return -100;
+        weight_data_packed.fill(0.f);
+        float* a = weight_data_packed;
+        const float* wsrc = weight_data;
+        for (int co = 0; co < num_output; co++)
+            memcpy(a + (size_t)co * Kp, wsrc + (size_t)co * K, (size_t)K * sizeof(float));
+        std::vector<vk_specialization_type> specializations(7);
+        specializations[0].i = K;
+        specializations[1].i = Kp;
+        specializations[2].i = elempack;
+        specializations[3].i = bias_term;
+        specializations[4].i = kernel_w;
+        specializations[5].i = dilation_w;
+        specializations[6].i = radish_gemm_rows;
+        pipeline_convolution1d_gemm = new Pipeline(vkdev);
+        pipeline_convolution1d_gemm->set_local_size_xyz(16, 8, 1);
+        pipeline_convolution1d_gemm->create(LayerShaderType::convolution1d_radish_gemm, opt, specializations);
+    }
     else if (use_gemm)
     {
         use_cooperative_matrix = vkdev->info.support_cooperative_matrix() && opt.use_cooperative_matrix && (opt.use_fp16_storage || opt.use_fp16_packed);
@@ -849,31 +882,6 @@ int Convolution1D_vulkan::create_pipeline(const Option& _opt)
             }
             pipeline_convolution1d_gemm->create(LayerShaderType::convolution1d_packed_gemm, gemm_opt, specializations);
         }
-    }
-    else if (is_conv1x1s1d1 && !dynamic_weight && out_elempack == 4 && activation_type == 0
-             && radish_gemm_available(vkdev, opt))
-    {
-        // radish: 1x1 Conv1D as a 64x64-tiled GEMM over [num_output][num_input]
-        use_radish_gemm = true;
-        const int Mp = radish_gemm_round(num_output, 64);
-        const int Kp = radish_gemm_round(num_input, 32);
-        weight_data_packed.create(Kp * Mp, (size_t)4u, 1);
-        if (weight_data_packed.empty())
-            return -100;
-        weight_data_packed.fill(0.f);
-        float* a = weight_data_packed;
-        const float* wsrc = weight_data;
-        for (int co = 0; co < num_output; co++)
-            for (int ci = 0; ci < num_input; ci++)
-                a[(size_t)co * Kp + ci] = wsrc[(size_t)co * num_input + ci];
-        std::vector<vk_specialization_type> specializations(4);
-        specializations[0].i = num_input;
-        specializations[1].i = Kp;
-        specializations[2].i = elempack;
-        specializations[3].i = bias_term;
-        pipeline_convolution1d_gemm = new Pipeline(vkdev);
-        pipeline_convolution1d_gemm->set_local_size_xyz(16, 8, 1);
-        pipeline_convolution1d_gemm->create(LayerShaderType::convolution1d_radish_gemm, opt, specializations);
     }
     else if (is_conv1x1s1d1)
     {
@@ -1182,6 +1190,7 @@ int Convolution1D_vulkan::destroy_pipeline(const Option& opt)
 
     use_radish_tiled = false;
     use_radish_gemm = false;
+    radish_gemm_rows = 8;
     use_radish_wino = false;
     radish_tiled32 = false;
     radish_planar = false;
@@ -1695,7 +1704,7 @@ int Convolution1D_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkC
         constants[3].i = outw;
         VkMat dispatcher;
         dispatcher.w = (outw + 63) / 64 * 16;
-        dispatcher.h = (num_output + 63) / 64 * 8;
+        dispatcher.h = (num_output + 8 * radish_gemm_rows - 1) / (8 * radish_gemm_rows) * 8;
         dispatcher.c = 1;
         cmd.record_pipeline(pipeline_convolution1d_gemm, bindings, constants, dispatcher);
         return 0;
