@@ -540,6 +540,17 @@ void GpuInfoPrivate::query_properties()
         bug_corrupted_online_pipeline_cache = true;
     }
 
+    if (bug_corrupted_online_pipeline_cache && physicalDeviceProperties.vendorID == 0x5143 && physicalDeviceProperties.deviceID == 506
+        && strcmp(physicalDeviceProperties.deviceName, "Radish Adreno 506 (experimental compute)") == 0)
+    {
+        const char* radish_pipeline_cache = getenv("RADISH_NCNN_PIPELINE_CACHE");
+        if (radish_pipeline_cache && strcmp(radish_pipeline_cache, "1") == 0)
+        {
+            bug_corrupted_online_pipeline_cache = false;
+            NCNN_LOGE("RADISH_NCNN_PIPELINE_CACHE=1: enabling ncnn pipeline artifact reuse for Radish Adreno 506");
+        }
+    }
+
     if (physicalDeviceProperties.vendorID == 0x5143 && !(physicalDeviceProperties.deviceID == 0x6040001 || physicalDeviceProperties.deviceID == 0x6050002))
     {
         // NOTE but qcom855/qcom855plus/qcom865 are known exceptions

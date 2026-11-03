@@ -3,10 +3,149 @@
 
 #include "convolution1d_vulkan.h"
 
+#include <limits.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <new>
+#include <cmath>
+
+#include "allocator.h"
 #include "layer_shader_type.h"
 #include "layer_type.h"
 
 namespace ncnn {
+
+static bool radish_planar_fp32(const Option& opt)
+{
+    return opt.use_packing_layout && !opt.use_fp16_packed && !opt.use_fp16_storage
+           && !opt.use_fp16_arithmetic && !opt.use_fp16_uniform
+           && !opt.use_bf16_packed && !opt.use_bf16_storage
+           && !opt.use_int8_inference && !opt.use_int8_packed && !opt.use_int8_storage
+           && !opt.use_int8_arithmetic && !opt.use_int8_uniform
+           && !opt.use_int16_packed && !opt.use_int16_storage
+           && !opt.use_subgroup_ops && !opt.use_cooperative_matrix && !opt.use_tensor_storage;
+}
+
+static bool radish_planar_buffer(const VkMat& blob, size_t required, const VulkanDevice* device)
+{
+    if (!required || !blob.data || !blob.refcount || !blob.allocator
+        || blob.allocator->vkdev != device || !blob.data->buffer || !blob.data->memory
+        || blob.n != 1 || blob.c <= 0 || blob.elempack <= 0
+        || blob.elemsize != (size_t)blob.elempack * 4u
+        || blob.cstep > SIZE_MAX / (size_t)blob.c)
+        return false;
+
+    const size_t count = blob.cstep * (size_t)blob.c;
+    if (!count || count > SIZE_MAX / blob.elemsize)
+        return false;
+#if NCNN_BATCH
+    if (blob.nstep != count)
+        return false;
+#endif
+    const size_t bytes = count * blob.elemsize;
+    if (required > bytes || blob.offset > blob.data->capacity
+        || bytes > blob.data->capacity - blob.offset
+        || blob.data->offset > SIZE_MAX - blob.data->capacity
+        || blob.buffer_capacity() != bytes)
+        return false;
+    const size_t alignment = device->info.buffer_offset_alignment();
+    return alignment && blob.buffer_offset() % alignment == 0
+           && blob.buffer_offset() % 16 == 0
+           && bytes <= device->info.physicalDeviceProperties().limits.maxStorageBufferRange;
+}
+
+static bool radish_planar_rank2(const VkMat& blob, int w, int h, int pack)
+{
+    if (w <= 0 || h <= 0 || (size_t)w > SIZE_MAX / (size_t)h)
+        return false;
+    return blob.dims == 2 && blob.n == 1 && blob.w == w && blob.h == h
+           && blob.d == 1 && blob.c == 1 && blob.elempack == pack
+           && blob.elemsize == (size_t)pack * 4u && blob.cstep == (size_t)w * h;
+}
+
+static bool radish_planar_disjoint(const VkMat& a, const VkMat& b)
+{
+    if (a.buffer() != b.buffer())
+        return true;
+    const size_t ao = a.buffer_offset();
+    const size_t bo = b.buffer_offset();
+    return ao <= bo ? a.buffer_capacity() <= bo - ao : b.buffer_capacity() <= ao - bo;
+}
+
+static bool radish_planar_pipeline(const Pipeline* pipeline, int bindings, int pushes, uint32_t x, uint32_t y)
+{
+    if (!pipeline || !pipeline->pipeline() || pipeline->local_size_x() != x
+        || pipeline->local_size_y() != y || pipeline->local_size_z() != 1
+        || pipeline->shader_info().binding_count != bindings
+        || pipeline->shader_info().push_constant_count != pushes)
+        return false;
+    for (int i = 0; i < bindings; i++)
+        if (pipeline->shader_info().binding_types[i] != 1)
+            return false;
+    return true;
+}
+
+static int radish_planar_pack_weights(const Mat& original, Mat& packed, int num_input, int padded_input, int num_output, int kernel_w, int weight_data_size, const VulkanDevice* device)
+{
+    if (num_input <= 0 || padded_input < num_input || num_output <= 0
+        || num_output % 64 || kernel_w <= 0 || weight_data_size <= 0)
+        return -1;
+
+    const uint64_t original_k = (uint64_t)num_input * kernel_w;
+    const uint64_t padded_k = (uint64_t)padded_input * kernel_w;
+    if (padded_k > 3584 || padded_k % 32)
+        return -1;
+    const uint64_t original_count = original_k * num_output;
+    const uint64_t padded_count = padded_k * num_output;
+    const uint64_t byte_limit = std::min((uint64_t)SIZE_MAX, (uint64_t)device->info.physicalDeviceProperties().limits.maxStorageBufferRange);
+    if (original_count != (uint64_t)weight_data_size || padded_count > INT_MAX
+        || padded_count > (SIZE_MAX - sizeof(int)) / sizeof(float)
+        || padded_count > byte_limit / sizeof(float)
+        || original.empty() || original.dims != 1 || original.n != 1
+        || original.w != weight_data_size || original.h != 1 || original.d != 1 || original.c != 1
+        || original.elemsize != 4u || original.elempack != 1
+        || original.cstep < (size_t)original_count)
+        return -1;
+#if NCNN_BATCH
+    if (original.nstep != original.total())
+        return -1;
+#endif
+
+    Mat destination((int)padded_count, (size_t)4u, 1);
+    if (destination.empty())
+        return -100;
+    destination.fill(0.f);
+    const float* source = original;
+    float* target = destination;
+    for (size_t k = 0; k < (size_t)original_k; k++)
+        for (int co = 0; co < num_output; co++)
+            memcpy(target + k * num_output + co, source + (size_t)co * original_k + k, sizeof(float));
+
+    packed = destination;
+    return 0;
+}
+
+static bool radish_pad_channels_tuple(int input, int output)
+{
+    return (input == 514 && output == 1024)
+           || (input == 1090 && (output == 1024 || output == 512));
+}
+
+static bool radish_pad_channels_rank2(const VkMat& blob, int w, int h, int pack)
+{
+    if (w <= 0 || h <= 0 || (pack != 1 && pack != 4)
+        || (size_t)w > SIZE_MAX / (size_t)h)
+        return false;
+    const size_t count = (size_t)w * h;
+    const size_t elemsize = (size_t)pack * 4u;
+    if (count > (SIZE_MAX - 15) / elemsize)
+        return false;
+    const size_t aligned_bytes = (count * elemsize + 15) / 16 * 16;
+    return blob.dims == 2 && blob.n == 1 && blob.w == w && blob.h == h
+           && blob.d == 1 && blob.c == 1 && blob.elempack == pack
+           && blob.elemsize == elemsize && blob.cstep == aligned_bytes / elemsize;
+}
 
 Convolution1D_vulkan::Convolution1D_vulkan()
 {
@@ -18,6 +157,12 @@ Convolution1D_vulkan::Convolution1D_vulkan()
     pipeline_convolution1d = 0;
     pipeline_convolution1d_1x1s1d1 = 0;
     pipeline_convolution1d_gemm = 0;
+    pipeline_radish_planar_pad = 0;
+
+    use_radish_tiled = false;
+    radish_tiled32 = false;
+    radish_planar = false;
+    radish_pad_channels = false;
 
     use_cooperative_matrix = false;
     coopmat_M = 0;
@@ -57,6 +202,29 @@ int Convolution1D_vulkan::create_pipeline(const Option& _opt)
         padding = ncnn::create_layer_vulkan(ncnn::LayerType::Padding);
         padding->vkdev = vkdev;
 
+        const Mat& shape = bottom_shapes.empty() ? Mat() : bottom_shapes[0];
+        if (shape.dims == 2 && shape.w > 0 && shape.h > 0)
+        {
+            long long bordered_w = 0;
+            if (pad_left >= 0 && pad_right >= 0)
+            {
+                bordered_w = (long long)shape.w + pad_left + pad_right;
+            }
+            else if (((pad_left == -233 && pad_right == -233) || (pad_left == -234 && pad_right == -234))
+                     && kernel_w > 0 && dilation_w > 0 && stride_w > 0)
+            {
+                const long long kernel_extent_w = (long long)dilation_w * (kernel_w - 1) + 1;
+                const long long wpad = kernel_extent_w + (shape.w - 1) / stride_w * (long long)stride_w - shape.w;
+                bordered_w = shape.w + std::max(0LL, wpad);
+            }
+
+            if (bordered_w > 0 && bordered_w <= INT_MAX)
+            {
+                padding->bottom_shapes.assign(1, shape);
+                padding->top_shapes.assign(1, Mat((int)bordered_w, shape.h, (void*)0, shape.elemsize, shape.elempack));
+            }
+        }
+
         ncnn::ParamDict pd;
         pd.set(0, 0);
         pd.set(1, 0);
@@ -77,7 +245,180 @@ int Convolution1D_vulkan::create_pipeline(const Option& _opt)
                     && num_input * maxk >= 8
                     && num_output >= 8;
 
-    if (use_gemm)
+    const char* tiled_env = getenv("RADISH_NCNN_TILED");
+    const char* tiled32_env = getenv("RADISH_NCNN_TILED32");
+    const bool requested_tiled32 = tiled32_env && strcmp(tiled32_env, "1") == 0;
+    use_radish_tiled = (requested_tiled32 || (tiled_env && strcmp(tiled_env, "1") == 0)) && use_gemm
+                       && vkdev->info.vendor_id() == 0x5143 && vkdev->info.device_id() == 506
+                       && strcmp(vkdev->info.device_name(), "Radish Adreno 506 (experimental compute)") == 0
+                       && vkdev->info.max_shared_memory_size() >= 16384
+                       && vkdev->info.max_workgroup_invocations() >= 128
+                       && vkdev->info.max_workgroup_size_x() >= 16 && vkdev->info.max_workgroup_size_y() >= 8
+                       && opt.use_packing_layout && elempack == 4 && out_elempack == 4
+                       && stride_w == 1 && (dilation_w == 1 || dilation_w == 3 || dilation_w == 5)
+                       && (num_input * maxk) % 32 == 0
+                       && num_input * maxk <= 3584
+                       && num_output % 64 == 0 && activation_type == 0
+                       && !opt.use_fp16_packed && !opt.use_fp16_storage
+                       && !opt.use_fp16_arithmetic && !opt.use_fp16_uniform
+                       && !opt.use_bf16_packed && !opt.use_bf16_storage
+                       && !opt.use_int8_inference && !opt.use_int8_packed && !opt.use_int8_storage
+                       && !opt.use_int8_arithmetic && !opt.use_int8_uniform
+                       && !opt.use_int16_packed && !opt.use_int16_storage
+                       && !opt.use_subgroup_ops && !opt.use_cooperative_matrix && !opt.use_tensor_storage;
+    radish_tiled32 = use_radish_tiled && requested_tiled32;
+    const char* planar_env = getenv("RADISH_NCNN_PLANAR");
+    const char* packed_a_env = getenv("RADISH_NCNN_PLANAR_PACKED_A");
+    const bool requested_packed_a = packed_a_env && strcmp(packed_a_env, "1") == 0;
+    uint32_t pad_bits;
+    memcpy(&pad_bits, &pad_value, sizeof(pad_bits));
+    radish_planar = planar_env && strcmp(planar_env, "1") == 0
+                    && use_radish_tiled && !radish_tiled32
+                    && pad_left >= 0 && pad_right >= 0
+                    && (pad_left > 0 || pad_right > 0) && pad_bits == 0;
+
+    const char* pad_channels_env = getenv("RADISH_NCNN_PAD_CHANNELS");
+    radish_pad_channels = pad_channels_env && strcmp(pad_channels_env, "1") == 0
+                          && tiled_env && strcmp(tiled_env, "1") == 0
+                          && planar_env && strcmp(planar_env, "1") == 0
+                          && !requested_tiled32 && use_gemm && !dynamic_weight
+                          && vkdev->info.vendor_id() == 0x5143 && vkdev->info.device_id() == 506
+                          && strcmp(vkdev->info.device_name(), "Radish Adreno 506 (experimental compute)") == 0
+                          && vkdev->info.max_shared_memory_size() >= 16384
+                          && vkdev->info.max_workgroup_invocations() >= 128
+                          && vkdev->info.max_workgroup_size_x() >= 16 && vkdev->info.max_workgroup_size_y() >= 8
+                          && opt.use_vulkan_compute && radish_planar_fp32(opt) && !opt.use_shader_local_memory
+                          && elempack == 1 && out_elempack == 4
+                          && kernel_w == 3 && dilation_w == 1 && stride_w == 1
+                          && pad_left == 1 && pad_right == 1 && pad_bits == 0
+                          && bias_term == 1 && activation_type == 0
+                          && radish_pad_channels_tuple(num_input, num_output)
+                          && (long long)num_input * 3 * num_output == weight_data_size;
+    if (radish_pad_channels)
+    {
+        const int channels = (num_input + 31) / 32 * 32;
+        const int k = channels * 3;
+        const uint64_t padded_count = (uint64_t)num_output * k;
+        const uint64_t byte_limit = std::min((uint64_t)SIZE_MAX, (uint64_t)vkdev->info.physicalDeviceProperties().limits.maxStorageBufferRange);
+        if (k <= 0 || k > 3584 || k % 32 || num_output % 64
+            || padded_count > INT_MAX || padded_count > byte_limit / 4
+            || weight_data.empty() || weight_data.elemsize != 4u || weight_data.elempack != 1
+            || weight_data.total() < (size_t)weight_data_size
+            || bias_data.empty() || bias_data.elemsize != 4u || bias_data.elempack != 1
+            || bias_data.total() < (size_t)num_output)
+            return -1;
+        const float* original = weight_data;
+        const float* bias = bias_data;
+        for (int i = 0; i < weight_data_size; i++)
+            if (!std::isfinite(original[i]))
+                return -1;
+        for (int i = 0; i < num_output; i++)
+            if (!std::isfinite(bias[i]))
+                return -1;
+        if (requested_packed_a)
+        {
+            const int pack_ret = radish_planar_pack_weights(weight_data, weight_data_packed, num_input, channels, num_output, kernel_w, weight_data_size, vkdev);
+            if (pack_ret != 0)
+                return pack_ret;
+        }
+        else
+        {
+            weight_data_packed.create((int)padded_count, (size_t)4u, 1);
+            if (weight_data_packed.empty())
+                return -100;
+            weight_data_packed.fill(0.f);
+            float* padded = weight_data_packed;
+            const size_t original_row = (size_t)num_input * 3;
+            for (int co = 0; co < num_output; co++)
+                memcpy(padded + (size_t)co * k, original + (size_t)co * original_row, original_row * sizeof(float));
+        }
+
+        use_radish_tiled = true;
+        radish_planar = true;
+        std::vector<vk_specialization_type> specializations(5);
+        specializations[0].i = 3;
+        specializations[1].i = channels;
+        specializations[2].i = num_output;
+        specializations[3].i = 1;
+        specializations[4].i = 1;
+        pipeline_convolution1d_gemm = new (std::nothrow) Pipeline(vkdev);
+        pipeline_radish_planar_pad = new (std::nothrow) Pipeline(vkdev);
+        if (!pipeline_convolution1d_gemm || !pipeline_radish_planar_pad)
+            return -100;
+        pipeline_convolution1d_gemm->set_local_size_xyz(16, 8, 1);
+        pipeline_radish_planar_pad->set_local_size_xyz(8, 8, 1);
+        const int math_shader_type = requested_packed_a ? LayerShaderType::convolution1d_radish_planar_packed_a : LayerShaderType::convolution1d_radish_planar;
+        const int math_ret = pipeline_convolution1d_gemm->create(math_shader_type, opt, specializations);
+        if (math_ret != 0)
+            return math_ret;
+        const std::vector<vk_specialization_type> pad_specializations;
+        const int pad_ret = pipeline_radish_planar_pad->create(LayerShaderType::convolution1d_radish_planar_pack1_pad, opt, pad_specializations);
+        if (pad_ret != 0)
+            return pad_ret;
+        if (!radish_planar_pipeline(pipeline_convolution1d_gemm, 4, 2, 16, 8)
+            || pipeline_convolution1d_gemm->shader_info().specialization_count != 5
+            || !radish_planar_pipeline(pipeline_radish_planar_pad, 2, 5, 8, 8)
+            || pipeline_radish_planar_pad->shader_info().specialization_count != 0)
+            return -1;
+        if (opt.lightmode)
+            weight_data.release();
+        return 0;
+    }
+
+    if (use_radish_tiled)
+    {
+        if (radish_planar && requested_packed_a)
+        {
+            const int pack_ret = radish_planar_pack_weights(weight_data, weight_data_packed, num_input, num_input, num_output, kernel_w, weight_data_size, vkdev);
+            if (pack_ret != 0)
+                return pack_ret;
+        }
+        else
+        {
+            // The original weights already have the required [output][input*tap]
+            // order. Keep one reference until upload instead of a second packing.
+            weight_data_packed = weight_data;
+        }
+
+        std::vector<vk_specialization_type> specializations(5);
+        specializations[0].i = kernel_w;
+        specializations[1].i = num_input;
+        specializations[2].i = num_output;
+        specializations[3].i = bias_term;
+        specializations[4].i = dilation_w;
+
+        pipeline_convolution1d_gemm = new Pipeline(vkdev);
+        const uint32_t local_x = radish_tiled32 ? 8 : 16;
+        const uint32_t local_y = radish_tiled32 ? 4 : 8;
+        pipeline_convolution1d_gemm->set_local_size_xyz(local_x, local_y, 1);
+        if (pipeline_convolution1d_gemm->local_size_x() != local_x
+            || pipeline_convolution1d_gemm->local_size_y() != local_y
+            || pipeline_convolution1d_gemm->local_size_z() != 1)
+            return -1;
+
+        const int shader_type = radish_planar ? (requested_packed_a ? LayerShaderType::convolution1d_radish_planar_packed_a : LayerShaderType::convolution1d_radish_planar)
+                                             : radish_tiled32 ? LayerShaderType::convolution1d_radish_tiled32 : LayerShaderType::convolution1d_radish_tiled;
+        const int ret = pipeline_convolution1d_gemm->create(shader_type, opt, specializations);
+        if (ret != 0)
+            return ret;
+
+        if (radish_planar)
+        {
+            if (!radish_planar_pipeline(pipeline_convolution1d_gemm, 4, 2, 16, 8))
+                return -1;
+            pipeline_radish_planar_pad = new (std::nothrow) Pipeline(vkdev);
+            if (!pipeline_radish_planar_pad)
+                return -100;
+            pipeline_radish_planar_pad->set_local_size_xyz(8, 8, 1);
+            const std::vector<vk_specialization_type> pad_specializations;
+            const int pad_ret = pipeline_radish_planar_pad->create(LayerShaderType::convolution1d_radish_planar_pad, opt, pad_specializations);
+            if (pad_ret != 0)
+                return pad_ret;
+            if (!radish_planar_pipeline(pipeline_radish_planar_pad, 2, 4, 8, 8))
+                return -1;
+        }
+    }
+    else if (use_gemm)
     {
         use_cooperative_matrix = vkdev->info.support_cooperative_matrix() && opt.use_cooperative_matrix && (opt.use_fp16_storage || opt.use_fp16_packed);
 
@@ -321,8 +662,29 @@ int Convolution1D_vulkan::create_pipeline(const Option& _opt)
             specializations[9 + 4].i = num_output;
             specializations[9 + 5].i = num_input;
 
+            Option gemm_opt = opt;
+            const char* shared32_env = getenv("RADISH_NCNN_SHARED32");
+            const bool use_shared32 = shared32_env && strcmp(shared32_env, "1") == 0
+                                      && vkdev->info.vendor_id() == 0x5143 && vkdev->info.device_id() == 506
+                                      && strcmp(vkdev->info.device_name(), "Radish Adreno 506 (experimental compute)") == 0
+                                      && !opt.use_fp16_packed && !opt.use_fp16_storage
+                                      && !opt.use_fp16_arithmetic && !opt.use_fp16_uniform
+                                      && !opt.use_bf16_packed && !opt.use_bf16_storage
+                                      && !opt.use_int8_inference;
+            if (use_shared32)
+                gemm_opt.use_shader_local_memory = true;
+            if (gemm_opt.use_shader_local_memory)
+            {
+                specializations.resize(9 + 7);
+                specializations[9 + 6].i = use_shared32 ? 1 : 0;
+            }
+
             pipeline_convolution1d_gemm = new Pipeline(vkdev);
-            if (opt.use_shader_local_memory)
+            if (use_shared32)
+            {
+                pipeline_convolution1d_gemm->set_local_size_xyz(8, 4, 1);
+            }
+            else if (gemm_opt.use_shader_local_memory)
             {
                 pipeline_convolution1d_gemm->set_local_size_xyz(8, 8, 1);
             }
@@ -330,7 +692,7 @@ int Convolution1D_vulkan::create_pipeline(const Option& _opt)
             {
                 pipeline_convolution1d_gemm->set_local_size_xyz(16, std::min(4, num_output_packed / 4), 1);
             }
-            pipeline_convolution1d_gemm->create(LayerShaderType::convolution1d_packed_gemm, opt, specializations);
+            pipeline_convolution1d_gemm->create(LayerShaderType::convolution1d_packed_gemm, gemm_opt, specializations);
         }
     }
     else if (is_conv1x1s1d1)
@@ -629,6 +991,14 @@ int Convolution1D_vulkan::destroy_pipeline(const Option& opt)
     delete pipeline_convolution1d_gemm;
     pipeline_convolution1d_gemm = 0;
 
+    delete pipeline_radish_planar_pad;
+    pipeline_radish_planar_pad = 0;
+
+    use_radish_tiled = false;
+    radish_tiled32 = false;
+    radish_planar = false;
+    radish_pad_channels = false;
+
     use_cooperative_matrix = false;
     coopmat_M = 0;
     coopmat_N = 0;
@@ -666,6 +1036,231 @@ int Convolution1D_vulkan::upload_model(VkTransfer& cmd, const Option& opt)
 
 int Convolution1D_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute& cmd, const Option& opt) const
 {
+    if (radish_pad_channels)
+    {
+        uint32_t pad_bits;
+        memcpy(&pad_bits, &pad_value, sizeof(pad_bits));
+        if (!use_radish_tiled || !radish_planar || radish_tiled32 || use_cooperative_matrix
+            || !opt.use_vulkan_compute || !radish_planar_fp32(opt) || opt.use_shader_local_memory
+            || !radish_planar_pipeline(pipeline_convolution1d_gemm, 4, 2, 16, 8)
+            || pipeline_convolution1d_gemm->shader_info().specialization_count != 5
+            || !radish_planar_pipeline(pipeline_radish_planar_pad, 2, 5, 8, 8)
+            || pipeline_radish_planar_pad->shader_info().specialization_count != 0
+            || !opt.workspace_vkallocator || !opt.blob_vkallocator
+            || opt.workspace_vkallocator->vkdev != vkdev || opt.blob_vkallocator->vkdev != vkdev
+            || &bottom_blob == &top_blob || bottom_blob.w <= 0
+            || !radish_pad_channels_tuple(bottom_blob.h, num_output)
+            || kernel_w != 3 || stride_w != 1 || dilation_w != 1
+            || pad_left != 1 || pad_right != 1 || pad_bits != 0
+            || bias_term != 1 || dynamic_weight || activation_type != 0)
+            return -1;
+        const int win = bottom_blob.w;
+        const int input_channels = bottom_blob.h;
+        const int channels = (input_channels + 31) / 32 * 32;
+        const int k = channels * 3;
+        if (k <= 0 || k > 3584 || k % 32 || num_output % 64
+            || (long long)input_channels * 3 * num_output != weight_data_size)
+            return -1;
+        const uint64_t rounded_width = ((uint64_t)win + 63) / 64 * 64;
+        const uint64_t pitch = (rounded_width + 2 + 3) / 4 * 4;
+        const uint64_t input_count = ((uint64_t)input_channels * win + 3) / 4 * 4;
+        const uint64_t workspace_count = (uint64_t)channels * pitch;
+        const uint64_t output_count = (uint64_t)num_output * win;
+        const uint64_t weight_count = (uint64_t)num_output * k;
+        const uint64_t bias_count = (uint64_t)num_output;
+        const VkPhysicalDeviceLimits& limits = vkdev->info.physicalDeviceProperties().limits;
+        const uint64_t byte_limit = std::min((uint64_t)SIZE_MAX, (uint64_t)limits.maxStorageBufferRange);
+        if (!pitch || pitch > INT_MAX || input_count > INT_MAX || workspace_count > INT_MAX
+            || output_count > INT_MAX || weight_count > INT_MAX
+            || input_count > byte_limit / 4 || workspace_count > byte_limit / 4
+            || output_count > byte_limit / 4 || weight_count > byte_limit / 4
+            || bias_count > byte_limit / 4
+            || (uint64_t)(channels - 1) * pitch + rounded_width + 1 >= workspace_count)
+            return -1;
+        const int lp = (int)pitch;
+        if (!radish_pad_channels_rank2(bottom_blob, win, input_channels, 1)
+            || !radish_planar_buffer(bottom_blob, (size_t)input_count * 4, vkdev)
+            || !radish_planar_buffer(weight_data_gpu, (size_t)weight_count * 4, vkdev)
+            || !radish_planar_buffer(bias_data_gpu, (size_t)bias_count * 4, vkdev))
+            return -1;
+        const uint64_t pad_groups_x = (pitch / 4 + 7) / 8;
+        const uint64_t pad_groups_y = ((uint64_t)channels + 7) / 8;
+        const uint64_t math_groups_x = rounded_width / 64;
+        const uint64_t math_groups_y = (uint64_t)num_output / 64;
+        if (pad_groups_x > limits.maxComputeWorkGroupCount[0]
+            || pad_groups_y > limits.maxComputeWorkGroupCount[1]
+            || math_groups_x > limits.maxComputeWorkGroupCount[0]
+            || math_groups_y > limits.maxComputeWorkGroupCount[1]
+            || !limits.maxComputeWorkGroupCount[2]
+            || math_groups_x > INT_MAX / 16 || math_groups_y > INT_MAX / 8)
+            return -1;
+        VkMat workspace;
+        workspace.create(lp, channels, (size_t)4u, 1, opt.workspace_vkallocator);
+        VkMat output;
+        output.create(win, num_output / 4, (size_t)16u, 4, opt.blob_vkallocator);
+        if (workspace.empty() || output.empty())
+            return -100;
+        if (!radish_pad_channels_rank2(workspace, lp, channels, 1)
+            || !radish_pad_channels_rank2(output, win, num_output / 4, 4)
+            || !radish_planar_buffer(workspace, (size_t)workspace_count * 4, vkdev)
+            || !radish_planar_buffer(output, (size_t)output_count * 4, vkdev)
+            || !radish_planar_disjoint(workspace, bottom_blob)
+            || !radish_planar_disjoint(workspace, weight_data_gpu)
+            || !radish_planar_disjoint(workspace, bias_data_gpu)
+            || !radish_planar_disjoint(output, bottom_blob)
+            || !radish_planar_disjoint(output, weight_data_gpu)
+            || !radish_planar_disjoint(output, bias_data_gpu)
+            || !radish_planar_disjoint(workspace, output))
+            return -1;
+        std::vector<VkMat> pad_bindings(2);
+        pad_bindings[0] = bottom_blob;
+        pad_bindings[1] = workspace;
+        std::vector<vk_constant_type> pad_constants(5);
+        pad_constants[0].i = win;
+        pad_constants[1].i = input_channels;
+        pad_constants[2].i = channels;
+        pad_constants[3].i = lp;
+        pad_constants[4].i = 1;
+        VkMat pad_dispatcher;
+        pad_dispatcher.w = lp / 4;
+        pad_dispatcher.h = channels;
+        pad_dispatcher.c = 1;
+        cmd.record_pipeline(pipeline_radish_planar_pad, pad_bindings, pad_constants, pad_dispatcher);
+        std::vector<VkMat> bindings(4);
+        bindings[0] = weight_data_gpu;
+        bindings[1] = workspace;
+        bindings[2] = output;
+        bindings[3] = bias_data_gpu;
+        std::vector<vk_constant_type> constants(2);
+        constants[0].i = lp;
+        constants[1].i = win;
+        VkMat dispatcher;
+        dispatcher.w = (int)math_groups_x * 16;
+        dispatcher.h = (int)math_groups_y * 8;
+        dispatcher.c = 1;
+        cmd.record_pipeline(pipeline_convolution1d_gemm, bindings, constants, dispatcher);
+        top_blob = output;
+        return 0;
+    }
+
+    if (radish_planar)
+    {
+        uint32_t pad_bits;
+        memcpy(&pad_bits, &pad_value, sizeof(pad_bits));
+        if (!use_radish_tiled || radish_tiled32 || !radish_planar_fp32(opt)
+            || !radish_planar_pipeline(pipeline_convolution1d_gemm, 4, 2, 16, 8)
+            || !radish_planar_pipeline(pipeline_radish_planar_pad, 2, 4, 8, 8)
+            || !opt.workspace_vkallocator || !opt.blob_vkallocator
+            || opt.workspace_vkallocator->vkdev != vkdev || opt.blob_vkallocator->vkdev != vkdev
+            || &bottom_blob == &top_blob || bottom_blob.w <= 0 || bottom_blob.h <= 0
+            || num_output <= 0 || num_output % 64 || kernel_w <= 0 || stride_w != 1
+            || (dilation_w != 1 && dilation_w != 3 && dilation_w != 5)
+            || weight_data_size <= 0 || dynamic_weight || activation_type != 0
+            || pad_left < 0 || pad_right < 0 || (pad_left == 0 && pad_right == 0)
+            || pad_bits != 0)
+            return -1;
+
+        const long long input_channels = (long long)bottom_blob.h * 4;
+        if (input_channels > 3584 || kernel_w > 3584 / input_channels)
+            return -1;
+        const long long k = input_channels * kernel_w;
+        if (k <= 0 || k > 3584 || k % 32
+            || k * num_output != weight_data_size)
+            return -1;
+
+        const int win = bottom_blob.w;
+        const int channels = (int)input_channels;
+        const long long extent = (long long)dilation_w * (kernel_w - 1);
+        const long long bordered_width = (long long)win + pad_left + pad_right;
+        const long long output_width = bordered_width - extent;
+        if (extent < 0 || extent > INT_MAX || bordered_width > INT_MAX
+            || output_width <= 0 || output_width > INT_MAX)
+            return -1;
+        const long long padded_output_width = ((output_width + 63) / 64) * 64;
+        const long long pitch = ((padded_output_width + extent + 3) / 4) * 4;
+        if (pitch <= 0 || pitch > INT_MAX
+            || input_channels * pitch > INT_MAX || input_channels * win > INT_MAX
+            || (long long)num_output * output_width > INT_MAX)
+            return -1;
+
+        const int lp = (int)pitch;
+        const int outw = (int)output_width;
+        const uint64_t input_bytes = (uint64_t)input_channels * win * 4;
+        const uint64_t workspace_bytes = (uint64_t)input_channels * lp * 4;
+        const uint64_t output_bytes = (uint64_t)num_output * outw * 4;
+        const uint64_t weight_bytes = (uint64_t)weight_data_size * 4;
+        const uint64_t bias_bytes = (uint64_t)num_output * 4;
+        const VkPhysicalDeviceLimits& limits = vkdev->info.physicalDeviceProperties().limits;
+        const uint64_t byte_limit = std::min((uint64_t)SIZE_MAX, (uint64_t)limits.maxStorageBufferRange);
+        if (input_bytes > byte_limit || workspace_bytes > byte_limit || output_bytes > byte_limit
+            || weight_bytes > byte_limit || (bias_term && bias_bytes > byte_limit)
+            || !radish_planar_rank2(bottom_blob, win, channels / 4, 4)
+            || !radish_planar_buffer(bottom_blob, (size_t)input_bytes, vkdev)
+            || !radish_planar_buffer(weight_data_gpu, (size_t)weight_bytes, vkdev)
+            || (bias_term && !radish_planar_buffer(bias_data_gpu, (size_t)bias_bytes, vkdev)))
+            return -1;
+
+        const uint64_t pad_groups_x = ((uint64_t)lp / 4 + 7) / 8;
+        const uint64_t pad_groups_y = ((uint64_t)channels + 7) / 8;
+        const uint64_t math_groups_x = ((uint64_t)outw + 63) / 64;
+        const uint64_t math_groups_y = (uint64_t)num_output / 64;
+        if (pad_groups_x > limits.maxComputeWorkGroupCount[0]
+            || pad_groups_y > limits.maxComputeWorkGroupCount[1]
+            || math_groups_x > limits.maxComputeWorkGroupCount[0]
+            || math_groups_y > limits.maxComputeWorkGroupCount[1]
+            || !limits.maxComputeWorkGroupCount[2])
+            return -1;
+
+        VkMat workspace;
+        workspace.create(lp, channels, (size_t)4u, 1, opt.workspace_vkallocator);
+        VkMat output;
+        output.create(outw, num_output / 4, (size_t)16u, 4, opt.blob_vkallocator);
+        if (workspace.empty() || output.empty())
+            return -100;
+        if (!radish_planar_rank2(workspace, lp, channels, 1)
+            || !radish_planar_rank2(output, outw, num_output / 4, 4)
+            || !radish_planar_buffer(workspace, (size_t)workspace_bytes, vkdev)
+            || !radish_planar_buffer(output, (size_t)output_bytes, vkdev)
+            || !radish_planar_disjoint(workspace, bottom_blob)
+            || !radish_planar_disjoint(workspace, weight_data_gpu)
+            || !radish_planar_disjoint(output, bottom_blob)
+            || !radish_planar_disjoint(output, weight_data_gpu)
+            || !radish_planar_disjoint(workspace, output)
+            || (bias_term && (!radish_planar_disjoint(workspace, bias_data_gpu)
+                              || !radish_planar_disjoint(output, bias_data_gpu))))
+            return -1;
+
+        std::vector<VkMat> pad_bindings(2);
+        pad_bindings[0] = bottom_blob;
+        pad_bindings[1] = workspace;
+        std::vector<vk_constant_type> pad_constants(4);
+        pad_constants[0].i = win;
+        pad_constants[1].i = channels;
+        pad_constants[2].i = lp;
+        pad_constants[3].i = pad_left;
+        VkMat pad_dispatcher;
+        pad_dispatcher.w = lp / 4;
+        pad_dispatcher.h = channels;
+        pad_dispatcher.c = 1;
+        cmd.record_pipeline(pipeline_radish_planar_pad, pad_bindings, pad_constants, pad_dispatcher);
+
+        std::vector<VkMat> bindings(4);
+        bindings[0] = weight_data_gpu;
+        bindings[1] = workspace;
+        bindings[2] = output;
+        bindings[3] = bias_data_gpu;
+        std::vector<vk_constant_type> constants(2);
+        constants[0].i = lp;
+        constants[1].i = outw;
+        VkMat dispatcher;
+        dispatcher.w = (int)math_groups_x * 16;
+        dispatcher.h = (int)math_groups_y * 8;
+        dispatcher.c = 1;
+        cmd.record_pipeline(pipeline_convolution1d_gemm, bindings, constants, dispatcher);
+        top_blob = output;
+        return 0;
+    }
+
     int w = bottom_blob.w;
     size_t elemsize = bottom_blob.elemsize;
     int elempack = bottom_blob.elempack;
@@ -751,6 +1346,37 @@ int Convolution1D_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkC
                     && !is_conv1x1s1d1
                     && num_input * maxk >= 8
                     && num_output >= 8;
+
+    if (use_radish_tiled)
+    {
+        if (!pipeline_convolution1d_gemm || pipeline_convolution1d_gemm->pipeline() == VK_NULL_HANDLE
+            || bottom_blob_bordered.dims != 2 || elempack != 4 || elemsize != 16u
+            || num_input != weight_data_size / maxk / num_output || outw <= 0)
+            return -1;
+
+        top_blob.create(outw, num_output / 4, (size_t)16u, 4, opt.blob_vkallocator);
+        if (top_blob.empty())
+            return -100;
+
+        std::vector<VkMat> bindings(4);
+        bindings[0] = weight_data_gpu;
+        bindings[1] = bottom_blob_bordered;
+        bindings[2] = top_blob;
+        bindings[3] = bias_data_gpu;
+
+        std::vector<vk_constant_type> constants(2);
+        constants[0].i = bottom_blob_bordered.w;
+        constants[1].i = outw;
+
+        VkMat dispatcher;
+        const int tile_width = radish_tiled32 ? 32 : 64;
+        const int tile_height = radish_tiled32 ? 32 : 64;
+        dispatcher.w = (outw / tile_width + (outw % tile_width != 0)) * (radish_tiled32 ? 8 : 16);
+        dispatcher.h = (num_output / tile_height) * (radish_tiled32 ? 4 : 8);
+        dispatcher.c = 1;
+        cmd.record_pipeline(pipeline_convolution1d_gemm, bindings, constants, dispatcher);
+        return 0;
+    }
 
     if (use_gemm && pipeline_convolution1d_gemm)
     {

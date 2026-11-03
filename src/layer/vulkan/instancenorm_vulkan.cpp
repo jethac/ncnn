@@ -3,13 +3,74 @@
 
 #include "instancenorm_vulkan.h"
 
+#include <limits.h>
+#include <limits>
+#include <stdlib.h>
+#include <string.h>
+
 #include "layer_shader_type.h"
 
 namespace ncnn {
 
+static bool radish_norm_sum4_fp32(const Option& opt)
+{
+    return opt.use_vulkan_compute && opt.use_packing_layout
+           && !opt.use_fp16_packed && !opt.use_fp16_storage
+           && !opt.use_fp16_arithmetic && !opt.use_fp16_uniform
+           && !opt.use_bf16_packed && !opt.use_bf16_storage
+           && !opt.use_int8_inference && !opt.use_int8_packed && !opt.use_int8_storage
+           && !opt.use_int8_arithmetic && !opt.use_int8_uniform
+           && !opt.use_int16_packed && !opt.use_int16_storage
+           && !opt.use_subgroup_ops && !opt.use_shader_local_memory
+           && !opt.use_cooperative_matrix && !opt.use_tensor_storage;
+}
+
+#if NCNN_STRING
+static bool radish_norm_outplace_name(const std::string& name, const char* suffix)
+{
+    const char* p = name.c_str();
+    if (strncmp(p, "radish_norm_", 12) != 0)
+        return false;
+    p += 12;
+    if (*p < '0' || *p > '9')
+        return false;
+    while (*p >= '0' && *p <= '9')
+        p++;
+    return strcmp(p, suffix) == 0;
+}
+#endif
+
+static bool radish_norm_outplace_buffer(const VkMat& blob, int width, int packs, const VulkanDevice* vkdev, const VkAllocator* allocator)
+{
+    if (!allocator || allocator->vkdev != vkdev || blob.allocator != allocator
+        || !blob.data || !blob.refcount || *blob.refcount <= 0 || !blob.data->buffer
+        || blob.dims != 3 || blob.n != 1 || blob.h != 1 || blob.d != 1
+        || blob.w != width || blob.c != packs || width <= 0 || packs <= 0
+        || blob.elempack != 4 || blob.elemsize != 16u || blob.cstep != (size_t)width)
+        return false;
+    const size_t max_size = std::numeric_limits<size_t>::max();
+    if ((size_t)width > max_size / (size_t)packs)
+        return false;
+    const size_t count = (size_t)width * packs;
+    if (count > max_size / 16u || blob.total() != count
+#if NCNN_BATCH
+        || blob.nstep != count
+#endif
+        || blob.offset > blob.data->capacity || count * 16u > blob.data->capacity - blob.offset
+        || blob.buffer_capacity() != count * 16u || blob.data->offset > max_size - blob.offset)
+        return false;
+    const size_t offset = blob.buffer_offset();
+    const size_t alignment = vkdev->info.physicalDeviceProperties().limits.minStorageBufferOffsetAlignment;
+    return offset % 16u == 0 && (!alignment || offset % alignment == 0)
+           && count * 16u <= max_size - offset
+           && count * 16u <= vkdev->info.physicalDeviceProperties().limits.maxStorageBufferRange;
+}
+
 InstanceNorm_vulkan::InstanceNorm_vulkan()
 {
     support_vulkan = true;
+    radish_norm_outplace = false;
+    pipeline_instancenorm_radish_outplace_pack4 = 0;
     support_vulkan_packing = true;
 
     pipeline_instancenorm_reduce_sum4_fp16_to_fp32 = 0;
@@ -25,6 +86,7 @@ InstanceNorm_vulkan::InstanceNorm_vulkan()
     pipeline_instancenorm_reduce_sum4_fp32_pack4[1] = 0;
     pipeline_instancenorm_reduce_mean_pack4 = 0;
     pipeline_instancenorm_sub_mean_square_pack4 = 0;
+    pipeline_instancenorm_radish_sum4_pack4 = 0;
     pipeline_instancenorm_coeffs_pack4 = 0;
     pipeline_instancenorm_norm_pack4 = 0;
 
@@ -44,6 +106,35 @@ int InstanceNorm_vulkan::create_pipeline(const Option& opt)
         use_subgroup_ops = false;
     }
     const Mat& shape = top_shapes.empty() ? Mat() : top_shapes[0];
+
+    const char* norm_sum4 = getenv("RADISH_NCNN_NORM_SUM4");
+    const bool use_radish_norm_sum4 = norm_sum4 && strcmp(norm_sum4, "1") == 0
+                                     && vkdev->info.vendor_id() == 0x5143
+                                     && vkdev->info.device_id() == 506
+                                     && strcmp(vkdev->info.device_name(), "Radish Adreno 506 (experimental compute)") == 0
+                                     && radish_norm_sum4_fp32(opt) && !use_subgroup_ops
+                                     && affine == 0 && eps == 1.e-5f
+                                     && (channels == 128 || channels == 256 || channels == 512 || channels == 1024)
+                                     && shape.dims == 3 && shape.n == 1 && shape.h == 1 && shape.d == 1
+                                     && shape.elempack == 4 && shape.elemsize == 16u && shape.c == channels / 4
+                                     && shape.w > 0 && shape.w <= INT_MAX - 3;
+
+    bool use_radish_norm_outplace = false;
+#if NCNN_STRING
+    const char* norm_outplace = getenv("RADISH_NCNN_NORM_OUTPLACE");
+    const char* reshape_alias = getenv("RADISH_NCNN_RESHAPE_ALIAS");
+    if (use_radish_norm_sum4 && norm_outplace && strcmp(norm_outplace, "1") == 0
+        && reshape_alias && strcmp(reshape_alias, "1") == 0
+        && radish_norm_outplace_name(name, "_instance") && bottom_shapes.size() == 1)
+    {
+        const Mat& input_shape = bottom_shapes[0];
+        use_radish_norm_outplace = input_shape.dims == 3 && input_shape.n == 1
+                                  && input_shape.w == shape.w && input_shape.h == 1 && input_shape.d == 1
+                                  && input_shape.c == shape.c && input_shape.elempack == 4 && input_shape.elemsize == 16u
+                                  && input_shape.cstep == (size_t)shape.w && shape.cstep == (size_t)shape.w
+                                  && (size_t)shape.w <= vkdev->info.physicalDeviceProperties().limits.maxStorageBufferRange / 16u / shape.c;
+    }
+#endif
 
     int _channels = channels;
     if (shape.dims == 3 || shape.dims == 4) _channels = shape.c * shape.elempack;
@@ -133,6 +224,22 @@ int InstanceNorm_vulkan::create_pipeline(const Option& opt)
                 pipeline_instancenorm_reduce_sum4_fp32_pack4[1] = new Pipeline(vkdev);
                 pipeline_instancenorm_reduce_sum4_fp32_pack4[1]->set_optimal_local_size_xyz(local_size_xyz);
                 pipeline_instancenorm_reduce_sum4_fp32_pack4[1]->create(LayerShaderType::instancenorm_reduce_sum4_fp32_pack4, opt, std::vector<vk_specialization_type>());
+
+                if (use_radish_norm_sum4)
+                {
+                    pipeline_instancenorm_radish_sum4_pack4 = new Pipeline(vkdev);
+                    pipeline_instancenorm_radish_sum4_pack4->set_local_size_xyz(16, 1, 4);
+                    int ret = pipeline_instancenorm_radish_sum4_pack4->create(LayerShaderType::instancenorm_radish_sum4_pack4, opt, std::vector<vk_specialization_type>());
+                    if (ret != 0)
+                        return ret;
+                    if (!pipeline_instancenorm_radish_sum4_pack4->pipeline()
+                        || pipeline_instancenorm_radish_sum4_pack4->local_size_x() != 16
+                        || pipeline_instancenorm_radish_sum4_pack4->local_size_y() != 1
+                        || pipeline_instancenorm_radish_sum4_pack4->local_size_z() != 4
+                        || pipeline_instancenorm_radish_sum4_pack4->shader_info().binding_count != 3
+                        || pipeline_instancenorm_radish_sum4_pack4->shader_info().push_constant_count != 8)
+                        return -1;
+                }
             }
         }
 
@@ -263,6 +370,34 @@ int InstanceNorm_vulkan::create_pipeline(const Option& opt)
             pipeline_instancenorm_norm_pack4 = new Pipeline(vkdev);
             pipeline_instancenorm_norm_pack4->set_optimal_local_size_xyz(local_size_xyz);
             pipeline_instancenorm_norm_pack4->create(LayerShaderType::instancenorm_norm_pack4, opt, specializations);
+
+            if (use_radish_norm_outplace)
+            {
+                pipeline_instancenorm_radish_outplace_pack4 = new Pipeline(vkdev);
+                pipeline_instancenorm_radish_outplace_pack4->set_optimal_local_size_xyz(local_size_xyz);
+                int ret = pipeline_instancenorm_radish_outplace_pack4->create(LayerShaderType::instancenorm_radish_outplace_pack4, opt, specializations);
+                if (ret != 0)
+                    return ret;
+                const Pipeline* pipeline = pipeline_instancenorm_radish_outplace_pack4;
+                if (!pipeline->pipeline() || !pipeline_instancenorm_norm_pack4->pipeline()
+                    || !pipeline_instancenorm_radish_sum4_pack4 || !pipeline_instancenorm_radish_sum4_pack4->pipeline()
+                    || !pipeline_instancenorm_reduce_sum4_fp16_to_fp32_pack4->pipeline()
+                    || !pipeline_instancenorm_reduce_sum4_fp32_pack4[0]->pipeline()
+                    || !pipeline_instancenorm_reduce_sum4_fp32_pack4[1]->pipeline()
+                    || !pipeline_instancenorm_reduce_mean_pack4->pipeline()
+                    || !pipeline_instancenorm_coeffs_pack4->pipeline()
+                    || pipeline->local_size_x() != pipeline_instancenorm_norm_pack4->local_size_x()
+                    || pipeline->local_size_y() != pipeline_instancenorm_norm_pack4->local_size_y()
+                    || pipeline->local_size_z() != pipeline_instancenorm_norm_pack4->local_size_z()
+                    || pipeline->shader_info().binding_count != 3 || pipeline->shader_info().push_constant_count != 5
+                    || pipeline->shader_info().specialization_count != 5)
+                    return -1;
+                for (int i = 0; i < 3; i++)
+                    if (pipeline->shader_info().binding_types[i] != 1)
+                        return -1;
+                radish_norm_outplace = true;
+                support_inplace = false;
+            }
         }
     }
 
@@ -271,6 +406,11 @@ int InstanceNorm_vulkan::create_pipeline(const Option& opt)
 
 int InstanceNorm_vulkan::destroy_pipeline(const Option& /*opt*/)
 {
+    delete pipeline_instancenorm_radish_outplace_pack4;
+    pipeline_instancenorm_radish_outplace_pack4 = 0;
+    radish_norm_outplace = false;
+    support_inplace = true;
+
     delete pipeline_instancenorm_reduce_sum4_fp16_to_fp32;
     pipeline_instancenorm_reduce_sum4_fp16_to_fp32 = 0;
 
@@ -305,6 +445,9 @@ int InstanceNorm_vulkan::destroy_pipeline(const Option& /*opt*/)
     delete pipeline_instancenorm_sub_mean_square_pack4;
     pipeline_instancenorm_sub_mean_square_pack4 = 0;
 
+    delete pipeline_instancenorm_radish_sum4_pack4;
+    pipeline_instancenorm_radish_sum4_pack4 = 0;
+
     delete pipeline_instancenorm_coeffs_pack4;
     pipeline_instancenorm_coeffs_pack4 = 0;
 
@@ -331,29 +474,123 @@ int InstanceNorm_vulkan::upload_model(VkTransfer& cmd, const Option& opt)
     return 0;
 }
 
+int InstanceNorm_vulkan::forward_radish_coefficients(const VkMat& input, VkMat& coefficients, VkCompute& cmd, const Option& opt) const
+{
+    if (&input == &coefficients || coefficients.data || coefficients.refcount || !coefficients.empty()
+        || !vkdev || !vkdev->is_valid() || vkdev->info.vendor_id() != 0x5143 || vkdev->info.device_id() != 506
+        || strcmp(vkdev->info.device_name(), "Radish Adreno 506 (experimental compute)") != 0
+        || !radish_norm_sum4_fp32(opt) || affine != 0 || eps != 1.e-5f
+        || (channels != 128 && channels != 256)
+        || !opt.workspace_vkallocator || opt.workspace_vkallocator->vkdev != vkdev
+        || bottom_shapes.size() != 1 || top_shapes.size() != 1
+        || input.w <= 0 || input.w > INT_MAX - 3
+        || !radish_norm_outplace_buffer(input, input.w, channels / 4, vkdev, opt.blob_vkallocator)
+        || !input.data->memory
+        || pipeline_instancenorm_reduce_subgroup || pipeline_instancenorm_reduce_subgroup_pack4)
+        return -1;
+    for (int i = 0; i < 2; i++)
+    {
+        const Mat& shape = i == 0 ? bottom_shapes[0] : top_shapes[0];
+        if (shape.dims != 3 || shape.n != 1 || shape.w != input.w || shape.h != 1 || shape.d != 1
+            || shape.c != channels / 4 || shape.elempack != 4 || shape.elemsize != 16u || shape.cstep != (size_t)input.w
+            || shape.total() != input.total()
+#if NCNN_BATCH
+            || shape.nstep != input.nstep
+#endif
+        )
+            return -1;
+    }
+    const Pipeline* pipelines[] = {pipeline_instancenorm_reduce_sum4_fp16_to_fp32_pack4,
+                                   pipeline_instancenorm_reduce_sum4_fp32_pack4[0],
+                                   pipeline_instancenorm_reduce_sum4_fp32_pack4[1],
+                                   pipeline_instancenorm_reduce_mean_pack4,
+                                   pipeline_instancenorm_radish_sum4_pack4,
+                                   pipeline_instancenorm_coeffs_pack4};
+    const int bindings[] = {2, 2, 2, 2, 3, 5};
+    const int pushes[] = {8, 8, 8, 5, 8, 1};
+    for (int i = 0; i < 6; i++)
+    {
+        const Pipeline* pipeline = pipelines[i];
+        if (!pipeline || !pipeline->pipeline() || pipeline->shader_info().binding_count != bindings[i]
+            || pipeline->shader_info().push_constant_count != pushes[i])
+            return -1;
+        for (int j = 0; j < bindings[i]; j++)
+            if (pipeline->shader_info().binding_types[j] != 1)
+                return -1;
+    }
+    VkMat unused_output;
+    return forward_impl(input, unused_output, cmd, opt, false, &coefficients);
+}
+
+int InstanceNorm_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute& cmd, const Option& opt) const
+{
+    if (!radish_norm_outplace)
+        return InstanceNorm::forward(bottom_blob, top_blob, cmd, opt);
+    if (&bottom_blob == &top_blob || !radish_norm_sum4_fp32(opt)
+        || !pipeline_instancenorm_radish_outplace_pack4 || !pipeline_instancenorm_radish_sum4_pack4
+        || top_shapes.size() != 1 || bottom_shapes.size() != 1
+        || bottom_blob.w <= 0 || bottom_blob.w > INT_MAX - 3 || bottom_blob.w != top_shapes[0].w
+        || bottom_blob.w != bottom_shapes[0].w || bottom_blob.c != channels / 4
+        || !radish_norm_outplace_buffer(bottom_blob, bottom_blob.w, channels / 4, vkdev, opt.blob_vkallocator))
+        return -1;
+
+    VkMat output(bottom_blob.w, 1, bottom_blob.c, 16u, 4, opt.blob_vkallocator);
+    if (output.empty())
+        return -100;
+    if (!radish_norm_outplace_buffer(output, bottom_blob.w, bottom_blob.c, vkdev, opt.blob_vkallocator)
+        || output.data == bottom_blob.data)
+        return -1;
+    if (output.buffer() == bottom_blob.buffer()
+        && output.buffer_offset() < bottom_blob.buffer_offset() + bottom_blob.buffer_capacity()
+        && bottom_blob.buffer_offset() < output.buffer_offset() + output.buffer_capacity())
+        return -1;
+
+    int ret = forward_impl(bottom_blob, output, cmd, opt, true);
+    if (ret != 0)
+        return ret;
+    top_blob = output;
+    return 0;
+}
+
 int InstanceNorm_vulkan::forward_inplace(VkMat& bottom_top_blob, VkCompute& cmd, const Option& opt) const
 {
-    int w = bottom_top_blob.w;
-    int h = bottom_top_blob.h * bottom_top_blob.d;
-    int c = bottom_top_blob.c;
+    return forward_impl(bottom_top_blob, bottom_top_blob, cmd, opt, false);
+}
+
+int InstanceNorm_vulkan::forward_impl(const VkMat& bottom_blob, VkMat& top_blob, VkCompute& cmd, const Option& opt, bool outplace, VkMat* coefficients_out) const
+{
+    int w = bottom_blob.w;
+    int h = bottom_blob.h * bottom_blob.d;
+    int c = bottom_blob.c;
     int size = w * h;
-    size_t elemsize = bottom_top_blob.elemsize;
-    int elempack = bottom_top_blob.elempack;
+    size_t elemsize = bottom_blob.elemsize;
+    int elempack = bottom_blob.elempack;
+
+    const bool use_radish_norm_sum4 = pipeline_instancenorm_radish_sum4_pack4
+                                     && radish_norm_sum4_fp32(opt)
+                                     && bottom_blob.dims == 3 && bottom_blob.n == 1
+                                     && bottom_blob.h == 1 && bottom_blob.d == 1
+                                     && elempack == 4 && elemsize == 16u && c > 0 && c == channels / 4
+                                     && !top_shapes.empty() && w == top_shapes[0].w
+                                     && w > 0 && w <= INT_MAX - 3 && bottom_blob.cstep == (size_t)w
+                                     && (size_t)w <= vkdev->info.physicalDeviceProperties().limits.maxStorageBufferRange / 16u / c;
 
     // mean and var
     VkMat mean_workspace(c, 4u * elempack, elempack, opt.workspace_vkallocator);
     VkMat var_workspace(c, 4u * elempack, elempack, opt.workspace_vkallocator);
+    if (use_radish_norm_sum4 && (mean_workspace.empty() || var_workspace.empty()))
+        return -100;
 
     const Pipeline* pipeline_reduce_subgroup = elempack == 4 ? pipeline_instancenorm_reduce_subgroup_pack4 : pipeline_instancenorm_reduce_subgroup;
     if (pipeline_reduce_subgroup)
     {
         std::vector<VkMat> bindings(3);
-        bindings[0] = bottom_top_blob;
+        bindings[0] = bottom_blob;
         bindings[1] = mean_workspace;
         bindings[2] = var_workspace;
 
         std::vector<vk_constant_type> constants(3);
-        constants[0].i = bottom_top_blob.cstep;
+        constants[0].i = bottom_blob.cstep;
         constants[1].i = size;
         constants[2].i = c;
 
@@ -377,19 +614,21 @@ int InstanceNorm_vulkan::forward_inplace(VkMat& bottom_top_blob, VkCompute& cmd,
             {
                 int reduced_w = (size + 3) / 4;
                 int reduced_h = 1;
-                int reduced_c = bottom_top_blob.c;
+                int reduced_c = bottom_blob.c;
 
                 sum_workspace.create(reduced_w, reduced_h, reduced_c, 4u * elempack, elempack, opt.workspace_vkallocator);
+                if (coefficients_out && sum_workspace.empty())
+                    return -100;
                 {
                     std::vector<VkMat> bindings(2);
-                    bindings[0] = bottom_top_blob;
+                    bindings[0] = bottom_blob;
                     bindings[1] = sum_workspace;
 
                     std::vector<vk_constant_type> constants(8);
                     constants[0].i = size;
                     constants[1].i = 1;
-                    constants[2].i = bottom_top_blob.c;
-                    constants[3].i = bottom_top_blob.cstep;
+                    constants[2].i = bottom_blob.c;
+                    constants[3].i = bottom_blob.cstep;
                     constants[4].i = sum_workspace.w;
                     constants[5].i = 1;
                     constants[6].i = sum_workspace.c;
@@ -410,6 +649,8 @@ int InstanceNorm_vulkan::forward_inplace(VkMat& bottom_top_blob, VkCompute& cmd,
 
                 VkMat sum_workspace_reduced;
                 sum_workspace_reduced.create(reduced_w, reduced_h, reduced_c, 4u * elempack, elempack, opt.workspace_vkallocator);
+                if (coefficients_out && sum_workspace_reduced.empty())
+                    return -100;
 
                 {
                     std::vector<VkMat> bindings(2);
@@ -458,19 +699,20 @@ int InstanceNorm_vulkan::forward_inplace(VkMat& bottom_top_blob, VkCompute& cmd,
         {
             // sub mean and square
             VkMat square_workspace;
-            square_workspace.create(w, h, c, 4u * elempack, elempack, opt.workspace_vkallocator);
+            if (!use_radish_norm_sum4)
             {
+                square_workspace.create(w, h, c, 4u * elempack, elempack, opt.workspace_vkallocator);
                 std::vector<VkMat> bindings(3);
-                bindings[0] = bottom_top_blob;
+                bindings[0] = bottom_blob;
                 bindings[1] = mean_workspace;
                 bindings[2] = square_workspace;
 
                 std::vector<vk_constant_type> constants(10);
-                constants[0].i = std::min(3, bottom_top_blob.dims);
-                constants[1].i = bottom_top_blob.w;
+                constants[0].i = std::min(3, bottom_blob.dims);
+                constants[1].i = bottom_blob.w;
                 constants[2].i = h;
-                constants[3].i = bottom_top_blob.c;
-                constants[4].i = bottom_top_blob.cstep;
+                constants[3].i = bottom_blob.c;
+                constants[4].i = bottom_blob.cstep;
                 constants[5].i = square_workspace.dims;
                 constants[6].i = square_workspace.w;
                 constants[7].i = square_workspace.h;
@@ -487,26 +729,30 @@ int InstanceNorm_vulkan::forward_inplace(VkMat& bottom_top_blob, VkCompute& cmd,
             {
                 int reduced_w = (size + 3) / 4;
                 int reduced_h = 1;
-                int reduced_c = square_workspace.c;
+                int reduced_c = use_radish_norm_sum4 ? bottom_blob.c : square_workspace.c;
 
                 sqsum_workspace.create(reduced_w, reduced_h, reduced_c, 4u * elempack, elempack, opt.workspace_vkallocator);
+                if (use_radish_norm_sum4 && sqsum_workspace.empty())
+                    return -100;
 
                 {
-                    std::vector<VkMat> bindings(2);
-                    bindings[0] = square_workspace;
+                    std::vector<VkMat> bindings(use_radish_norm_sum4 ? 3 : 2);
+                    bindings[0] = use_radish_norm_sum4 ? bottom_blob : square_workspace;
                     bindings[1] = sqsum_workspace;
+                    if (use_radish_norm_sum4)
+                        bindings[2] = mean_workspace;
 
                     std::vector<vk_constant_type> constants(8);
                     constants[0].i = size;
                     constants[1].i = 1;
-                    constants[2].i = square_workspace.c;
-                    constants[3].i = square_workspace.cstep;
+                    constants[2].i = use_radish_norm_sum4 ? bottom_blob.c : square_workspace.c;
+                    constants[3].i = use_radish_norm_sum4 ? bottom_blob.cstep : square_workspace.cstep;
                     constants[4].i = sqsum_workspace.w;
                     constants[5].i = 1;
                     constants[6].i = sqsum_workspace.c;
                     constants[7].i = sqsum_workspace.cstep;
 
-                    const Pipeline* pipeline = elempack == 4 ? pipeline_instancenorm_reduce_sum4_fp32_pack4[0] : pipeline_instancenorm_reduce_sum4_fp32[0];
+                    const Pipeline* pipeline = use_radish_norm_sum4 ? pipeline_instancenorm_radish_sum4_pack4 : (elempack == 4 ? pipeline_instancenorm_reduce_sum4_fp32_pack4[0] : pipeline_instancenorm_reduce_sum4_fp32[0]);
 
                     cmd.record_pipeline(pipeline, bindings, constants, sqsum_workspace);
                 }
@@ -521,6 +767,8 @@ int InstanceNorm_vulkan::forward_inplace(VkMat& bottom_top_blob, VkCompute& cmd,
 
                 VkMat sqsum_workspace_reduced;
                 sqsum_workspace_reduced.create(reduced_w, reduced_h, reduced_c, 4u * elempack, elempack, opt.workspace_vkallocator);
+                if (coefficients_out && sqsum_workspace_reduced.empty())
+                    return -100;
 
                 {
                     std::vector<VkMat> bindings(2);
@@ -569,6 +817,8 @@ int InstanceNorm_vulkan::forward_inplace(VkMat& bottom_top_blob, VkCompute& cmd,
     // coeffs
     VkMat coeffs_workspace;
     coeffs_workspace.create(c, elemsize * 2, elempack * 2, opt.workspace_vkallocator);
+    if (coefficients_out && coeffs_workspace.empty())
+        return -100;
     {
         std::vector<VkMat> bindings(5);
         bindings[0] = coeffs_workspace;
@@ -585,22 +835,30 @@ int InstanceNorm_vulkan::forward_inplace(VkMat& bottom_top_blob, VkCompute& cmd,
         cmd.record_pipeline(pipeline, bindings, constants, coeffs_workspace);
     }
 
+    if (coefficients_out)
+    {
+        *coefficients_out = coeffs_workspace;
+        return 0;
+    }
+
     // norm
     {
-        std::vector<VkMat> bindings(2);
-        bindings[0] = bottom_top_blob;
+        std::vector<VkMat> bindings(outplace ? 3 : 2);
+        bindings[0] = bottom_blob;
         bindings[1] = coeffs_workspace;
+        if (outplace)
+            bindings[2] = top_blob;
 
         std::vector<vk_constant_type> constants(5);
-        constants[0].i = std::min(3, bottom_top_blob.dims);
-        constants[1].i = bottom_top_blob.w;
+        constants[0].i = std::min(3, bottom_blob.dims);
+        constants[1].i = bottom_blob.w;
         constants[2].i = h;
-        constants[3].i = bottom_top_blob.c;
-        constants[4].i = bottom_top_blob.cstep;
+        constants[3].i = bottom_blob.c;
+        constants[4].i = bottom_blob.cstep;
 
-        const Pipeline* pipeline = elempack == 4 ? pipeline_instancenorm_norm_pack4 : pipeline_instancenorm_norm;
+        const Pipeline* pipeline = outplace ? pipeline_instancenorm_radish_outplace_pack4 : (elempack == 4 ? pipeline_instancenorm_norm_pack4 : pipeline_instancenorm_norm);
 
-        cmd.record_pipeline(pipeline, bindings, constants, bottom_top_blob);
+        cmd.record_pipeline(pipeline, bindings, constants, top_blob);
     }
 
     return 0;

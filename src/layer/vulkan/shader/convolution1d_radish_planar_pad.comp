@@ -1,0 +1,29 @@
+#version 450
+
+layout(binding = 0) readonly buffer bottom_blob { float bottom_blob_data[]; };
+layout(binding = 1) writeonly buffer planar_blob { vec4 planar_blob_data[]; };
+
+layout(push_constant) uniform parameter
+{
+    int w;
+    int channels;
+    int pitch;
+    int left;
+} p;
+
+void main()
+{
+    const int q = int(gl_GlobalInvocationID.x);
+    const int ci = int(gl_GlobalInvocationID.y);
+    if (q >= p.pitch / 4 || ci >= p.channels)
+        return;
+
+    const int x = q * 4 - p.left;
+    const int base = (ci / 4) * p.w * 4 + ci % 4;
+    vec4 value = vec4(0.f);
+    if (x >= 0 && x < p.w) value.x = bottom_blob_data[base + x * 4];
+    if (x + 1 >= 0 && x + 1 < p.w) value.y = bottom_blob_data[base + (x + 1) * 4];
+    if (x + 2 >= 0 && x + 2 < p.w) value.z = bottom_blob_data[base + (x + 2) * 4];
+    if (x + 3 >= 0 && x + 3 < p.w) value.w = bottom_blob_data[base + (x + 3) * 4];
+    planar_blob_data[ci * (p.pitch / 4) + q] = value;
+}

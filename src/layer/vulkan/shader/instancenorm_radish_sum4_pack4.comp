@@ -1,0 +1,52 @@
+#version 450
+
+layout(binding = 0) readonly buffer input_blob { vec4 input_blob_data[]; };
+layout(binding = 1) writeonly buffer sum_blob { vec4 sum_blob_data[]; };
+layout(binding = 2) readonly buffer mean_blob { vec4 mean_blob_data[]; };
+
+layout(push_constant) uniform parameter
+{
+    int w;
+    int h;
+    int c;
+    int cstep;
+    int outw;
+    int outh;
+    int outc;
+    int outcstep;
+} p;
+
+void main()
+{
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    int gz = int(gl_GlobalInvocationID.z);
+    if (gx >= p.outw || gy >= p.outh || gz >= p.outc)
+        return;
+
+    int sx = gx * 4;
+    int offset = gz * p.cstep + sx;
+    vec4 mean = mean_blob_data[gz];
+    precise vec4 d0 = input_blob_data[offset] - mean;
+    precise vec4 q0 = d0 * d0;
+    precise vec4 sum = q0;
+    if (sx + 1 < p.w)
+    {
+        precise vec4 d1 = input_blob_data[offset + 1] - mean;
+        precise vec4 q1 = d1 * d1;
+        sum = sum + q1;
+    }
+    if (sx + 2 < p.w)
+    {
+        precise vec4 d2 = input_blob_data[offset + 2] - mean;
+        precise vec4 q2 = d2 * d2;
+        sum = sum + q2;
+    }
+    if (sx + 3 < p.w)
+    {
+        precise vec4 d3 = input_blob_data[offset + 3] - mean;
+        precise vec4 q3 = d3 * d3;
+        sum = sum + q3;
+    }
+    sum_blob_data[gz * p.outcstep + gx] = sum;
+}
