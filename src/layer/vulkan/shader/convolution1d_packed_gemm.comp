@@ -275,9 +275,9 @@ void main()
             const ivec4 v_offset = sz * psc(w) + sx4 + kx * dilation_w;
 
             v0 = buffer_ld4(bottom_blob_data_4, v_offset.r);
-            v1 = buffer_ld4(bottom_blob_data_4, v_offset.g);
-            v2 = buffer_ld4(bottom_blob_data_4, v_offset.b);
-            v3 = buffer_ld4(bottom_blob_data_4, v_offset.a);
+            v1 = gx + 1 < outsize ? buffer_ld4(bottom_blob_data_4, v_offset.g) : afpvec4(0.f);
+            v2 = gx + 2 < outsize ? buffer_ld4(bottom_blob_data_4, v_offset.b) : afpvec4(0.f);
+            v3 = gx + 3 < outsize ? buffer_ld4(bottom_blob_data_4, v_offset.a) : afpvec4(0.f);
         }
         else
         {

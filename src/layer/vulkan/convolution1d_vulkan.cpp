@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include <new>
 #include <cmath>
 
@@ -126,6 +127,74 @@ static int radish_planar_pack_weights(const Mat& original, Mat& packed, int num_
     return 0;
 }
 
+static uint16_t radish_weight_half_rte(float value)
+{
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    const uint32_t sign = (bits >> 16) & 0x8000u;
+    const uint32_t exponent = (bits >> 23) & 255u;
+    const uint32_t fraction = bits & 0x7fffffu;
+    if (exponent < 102)
+        return (uint16_t)sign;
+    if (exponent < 113)
+    {
+        const uint32_t mantissa = fraction | 0x800000u;
+        const unsigned shift = 126 - exponent;
+        uint32_t rounded = mantissa >> shift;
+        const uint32_t remainder = mantissa & ((1u << shift) - 1u);
+        const uint32_t midpoint = 1u << (shift - 1);
+        rounded += remainder > midpoint || (remainder == midpoint && (rounded & 1u));
+        return (uint16_t)(sign | rounded);
+    }
+    if (exponent > 142)
+        return (uint16_t)(sign | 0x7c00u);
+    uint32_t rounded = ((exponent - 112) << 10) | (fraction >> 13);
+    const uint32_t remainder = fraction & 8191u;
+    rounded += remainder > 4096u || (remainder == 4096u && (rounded & 1u));
+    return (uint16_t)(sign | rounded);
+}
+
+static int radish_direct_pack_half_weights(Mat& packed, int dilation)
+{
+    const int count = 128 * 128 * 11;
+    if (packed.empty() || packed.dims != 1 || packed.n != 1 || packed.w != count
+        || packed.elemsize != 4u || packed.elempack != 1 || packed.total() < (size_t)count)
+        return -1;
+    Mat words(count / 2, (size_t)4u, 1);
+    if (words.empty())
+        return -100;
+    const float* source = packed;
+    uint32_t* destination = words;
+    double row_norm[128] = {};
+    double row_error[128] = {};
+    for (int i = 0; i < count; i += 2)
+    {
+        uint16_t encoded[2];
+        for (int j = 0; j < 2; j++)
+        {
+            uint32_t raw;
+            memcpy(&raw, source + i + j, sizeof(raw));
+            if ((raw & 0x7f800000u) == 0x7f800000u)
+                return 0;
+            encoded[j] = radish_weight_half_rte(source[i + j]);
+            if ((encoded[j] & 0x7c00u) == 0x7c00u)
+                return 0;
+            const float decoded = float16_to_float32(encoded[j]);
+            const int co = (i + j) & 127;
+            row_norm[co] += std::fabs((double)source[i + j]);
+            row_error[co] += std::fabs((double)source[i + j] - (double)decoded);
+        }
+        destination[i / 2] = (uint32_t)encoded[0] | ((uint32_t)encoded[1] << 16);
+    }
+    for (int co = 0; co < 128; co++)
+        if (row_error[co] > row_norm[co] / 4096.0 + (128 * 11) / 33554432.0
+            || row_error[co] > 1.0 / 512.0)
+            return 0;
+    packed = words;
+    fprintf(stderr, "RADISH_CONV_PRECISION channels=128 kernel=11 dilation=%d weights=fp16-rte activations=fp32 shared=fp32 accumulation=fp32 bias=fp32 output=fp32 normalization=fp32\n", dilation);
+    return 1;
+}
+
 static bool radish_pad_channels_tuple(int input, int output)
 {
     return (input == 514 && output == 1024)
@@ -163,6 +232,8 @@ Convolution1D_vulkan::Convolution1D_vulkan()
     radish_tiled32 = false;
     radish_planar = false;
     radish_pad_channels = false;
+    radish_direct_window = false;
+    radish_direct_weight_half = false;
 
     use_cooperative_matrix = false;
     coopmat_M = 0;
@@ -276,6 +347,9 @@ int Convolution1D_vulkan::create_pipeline(const Option& _opt)
                     && use_radish_tiled && !radish_tiled32
                     && pad_left >= 0 && pad_right >= 0
                     && (pad_left > 0 || pad_right > 0) && pad_bits == 0;
+    radish_direct_window = radish_planar && requested_packed_a
+                           && num_input == 128 && num_output == 128 && kernel_w == 11
+                           && bias_term == 1 && !dynamic_weight;
 
     const char* pad_channels_env = getenv("RADISH_NCNN_PAD_CHANNELS");
     radish_pad_channels = pad_channels_env && strcmp(pad_channels_env, "1") == 0
@@ -372,6 +446,15 @@ int Convolution1D_vulkan::create_pipeline(const Option& _opt)
             const int pack_ret = radish_planar_pack_weights(weight_data, weight_data_packed, num_input, num_input, num_output, kernel_w, weight_data_size, vkdev);
             if (pack_ret != 0)
                 return pack_ret;
+            if (radish_direct_window)
+            {
+                const int half_ret = radish_direct_pack_half_weights(weight_data_packed, dilation_w);
+                if (half_ret < 0)
+                    return half_ret;
+                radish_direct_weight_half = half_ret == 1;
+                if (!radish_direct_weight_half)
+                    fprintf(stderr, "RADISH_CONV_PRECISION channels=128 kernel=11 dilation=%d weights=fp32 activations=fp32 shared=fp32 accumulation=fp32 bias=fp32 output=fp32 normalization=fp32\n", dilation_w);
+            }
         }
         else
         {
@@ -396,13 +479,20 @@ int Convolution1D_vulkan::create_pipeline(const Option& _opt)
             || pipeline_convolution1d_gemm->local_size_z() != 1)
             return -1;
 
-        const int shader_type = radish_planar ? (requested_packed_a ? LayerShaderType::convolution1d_radish_planar_packed_a : LayerShaderType::convolution1d_radish_planar)
-                                             : radish_tiled32 ? LayerShaderType::convolution1d_radish_tiled32 : LayerShaderType::convolution1d_radish_tiled;
+        const int shader_type = radish_direct_window ? (radish_direct_weight_half ? LayerShaderType::convolution1d_radish_direct_window_fp16w : LayerShaderType::convolution1d_radish_direct_window)
+                                  : radish_planar ? (requested_packed_a ? LayerShaderType::convolution1d_radish_planar_packed_a : LayerShaderType::convolution1d_radish_planar)
+                                                 : radish_tiled32 ? LayerShaderType::convolution1d_radish_tiled32 : LayerShaderType::convolution1d_radish_tiled;
         const int ret = pipeline_convolution1d_gemm->create(shader_type, opt, specializations);
         if (ret != 0)
             return ret;
 
-        if (radish_planar)
+        if (radish_direct_window)
+        {
+            if (!radish_planar_pipeline(pipeline_convolution1d_gemm, 4, 3, 16, 8)
+                || pipeline_convolution1d_gemm->shader_info().specialization_count != 5)
+                return -1;
+        }
+        else if (radish_planar)
         {
             if (!radish_planar_pipeline(pipeline_convolution1d_gemm, 4, 2, 16, 8))
                 return -1;
@@ -998,6 +1088,8 @@ int Convolution1D_vulkan::destroy_pipeline(const Option& opt)
     radish_tiled32 = false;
     radish_planar = false;
     radish_pad_channels = false;
+    radish_direct_window = false;
+    radish_direct_weight_half = false;
 
     use_cooperative_matrix = false;
     coopmat_M = 0;
@@ -1036,6 +1128,67 @@ int Convolution1D_vulkan::upload_model(VkTransfer& cmd, const Option& opt)
 
 int Convolution1D_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute& cmd, const Option& opt) const
 {
+    if (radish_direct_window)
+    {
+        uint32_t pad_bits;
+        memcpy(&pad_bits, &pad_value, sizeof(pad_bits));
+        if (!use_radish_tiled || !radish_planar || radish_tiled32 || radish_pad_channels
+            || use_cooperative_matrix || !radish_planar_fp32(opt) || !opt.use_vulkan_compute
+            || !radish_planar_pipeline(pipeline_convolution1d_gemm, 4, 3, 16, 8)
+            || pipeline_convolution1d_gemm->shader_info().specialization_count != 5
+            || pipeline_radish_planar_pad || !opt.blob_vkallocator
+            || opt.blob_vkallocator->vkdev != vkdev || &bottom_blob == &top_blob
+            || !radish_planar_rank2(bottom_blob, bottom_blob.w, 32, 4)
+            || kernel_w != 11 || num_output != 128 || weight_data_size != 180224
+            || stride_w != 1 || (dilation_w != 1 && dilation_w != 3 && dilation_w != 5)
+            || bias_term != 1 || dynamic_weight || activation_type != 0
+            || pad_left < 0 || pad_right < 0 || pad_bits != 0)
+            return -1;
+        const int64_t outw64 = (int64_t)bottom_blob.w + pad_left + pad_right - 10 * dilation_w;
+        const uint64_t rounded = outw64 > 0 ? ((uint64_t)outw64 + 63) / 64 * 64 : 0;
+        const uint64_t input_bytes = (uint64_t)bottom_blob.w * 128 * 4;
+        const uint64_t output_bytes = outw64 > 0 ? (uint64_t)outw64 * 128 * 4 : 0;
+        const VkPhysicalDeviceLimits& limits = vkdev->info.physicalDeviceProperties().limits;
+        const uint64_t byte_limit = std::min((uint64_t)SIZE_MAX, (uint64_t)limits.maxStorageBufferRange);
+        if (outw64 <= 0 || outw64 > INT_MAX || rounded > INT_MAX - 128
+            || (uint64_t)pad_left > INT_MAX - rounded - 128
+            || input_bytes > byte_limit || output_bytes > byte_limit
+            || input_bytes / 4 > INT_MAX || output_bytes / 4 > INT_MAX
+            || rounded / 64 > limits.maxComputeWorkGroupCount[0]
+            || limits.maxComputeWorkGroupCount[1] < 2 || !limits.maxComputeWorkGroupCount[2]
+            || rounded / 64 > INT_MAX / 16
+            || !radish_planar_buffer(bottom_blob, (size_t)input_bytes, vkdev)
+            || !radish_planar_buffer(weight_data_gpu, (size_t)weight_data_size * (radish_direct_weight_half ? 2u : 4u), vkdev)
+            || !radish_planar_buffer(bias_data_gpu, 128 * 4, vkdev))
+            return -1;
+        const int outw = (int)outw64;
+        VkMat output;
+        output.create(outw, 32, (size_t)16u, 4, opt.blob_vkallocator);
+        if (output.empty())
+            return -100;
+        if (!radish_planar_rank2(output, outw, 32, 4)
+            || !radish_planar_buffer(output, (size_t)output_bytes, vkdev)
+            || !radish_planar_disjoint(output, bottom_blob)
+            || !radish_planar_disjoint(output, weight_data_gpu)
+            || !radish_planar_disjoint(output, bias_data_gpu))
+            return -1;
+        std::vector<VkMat> bindings(4);
+        bindings[0] = weight_data_gpu;
+        bindings[1] = bottom_blob;
+        bindings[2] = output;
+        bindings[3] = bias_data_gpu;
+        std::vector<vk_constant_type> constants(3);
+        constants[0].i = bottom_blob.w;
+        constants[1].i = outw;
+        constants[2].i = pad_left;
+        VkMat dispatcher;
+        dispatcher.w = (int)(rounded / 64) * 16;
+        dispatcher.h = 16;
+        dispatcher.c = 1;
+        cmd.record_pipeline(pipeline_convolution1d_gemm, bindings, constants, dispatcher);
+        top_blob = output;
+        return 0;
+    }
     if (radish_pad_channels)
     {
         uint32_t pad_bits;

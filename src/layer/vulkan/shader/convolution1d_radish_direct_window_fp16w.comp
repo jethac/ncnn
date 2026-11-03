@@ -1,0 +1,111 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+
+layout(constant_id = 0) const int kernel_w = 11;
+layout(constant_id = 1) const int num_input = 128;
+layout(constant_id = 2) const int num_output = 128;
+layout(constant_id = 3) const int bias_term = 1;
+layout(constant_id = 4) const int dilation_w = 1;
+
+layout(binding = 0) readonly buffer weights { uvec2 weight_data[]; };
+layout(binding = 1) readonly buffer bottom_blob { vec4 bottom_blob_data[]; };
+layout(binding = 2) writeonly buffer top_blob { vec4 top_blob_data[]; };
+layout(binding = 3) readonly buffer bias_blob { float bias_data[]; };
+
+layout(push_constant) uniform parameter
+{
+    int w;
+    int outw;
+    int left;
+} p;
+
+shared float sa[32][64];
+shared float window[4][128];
+
+void main()
+{
+    const int tx = int(gl_LocalInvocationID.x);
+    const int ty = int(gl_LocalInvocationID.y);
+    const int tid = ty * 16 + tx;
+    const int mb = int(gl_WorkGroupID.y) * 64;
+    const int nb = int(gl_WorkGroupID.x) * 64;
+    const int K = num_input * kernel_w;
+    vec4 acc[8];
+    for (int r = 0; r < 8; r++)
+    {
+        const int co = mb + ty * 8 + r;
+        acc[r] = vec4(bias_term != 0 && co < num_output ? bias_data[co] : 0.f);
+    }
+
+    for (int k0 = 0; k0 < K; k0 += 32)
+    {
+        for (int i = tid; i < 32 * 16; i += 128)
+        {
+            const int r = i >> 4;
+            const int q = i & 15;
+            const uvec2 packed_weight = weight_data[(k0 + r) * (num_output / 4) + (mb >> 2) + q];
+            vec4 a = vec4(unpackHalf2x16(packed_weight.x), unpackHalf2x16(packed_weight.y));
+            sa[r][q * 4] = a.x;
+            sa[r][q * 4 + 1] = a.y;
+            sa[r][q * 4 + 2] = a.z;
+            sa[r][q * 4 + 3] = a.w;
+        }
+        const int first_channel = int(uint(k0) / uint(kernel_w));
+        const int shift = first_channel & 3;
+        const int pack = first_channel >> 2;
+        const int sx = nb + tid - p.left;
+        vec4 a = vec4(0.f);
+        vec4 b = vec4(0.f);
+        if (tid < 64 + (kernel_w - 1) * dilation_w && sx >= 0 && sx < p.w)
+        {
+            a = bottom_blob_data[pack * p.w + sx];
+            if (shift != 0 && pack + 1 < num_input / 4)
+                b = bottom_blob_data[(pack + 1) * p.w + sx];
+        }
+        vec4 v = a;
+        if (shift == 1) v = vec4(a.yzw, b.x);
+        if (shift == 2) v = vec4(a.zw, b.xy);
+        if (shift == 3) v = vec4(a.w, b.xyz);
+        window[0][tid] = v.x;
+        window[1][tid] = v.y;
+        window[2][tid] = v.z;
+        window[3][tid] = v.w;
+        barrier();
+
+        int channel = 0;
+        int tap = k0 - first_channel * kernel_w;
+        [[dont_unroll]] for (int k = 0; k < 32; k++)
+        {
+            const int ix = tap * dilation_w + tx * 4;
+            vec4 bv = vec4(window[channel][ix], window[channel][ix + 1],
+                           window[channel][ix + 2], window[channel][ix + 3]);
+            for (int r = 0; r < 8; r++)
+            {
+                float av = sa[k][ty * 8 + r];
+                acc[r] += av * bv;
+            }
+            tap++;
+            if (tap == kernel_w)
+            {
+                tap = 0;
+                channel++;
+            }
+        }
+        barrier();
+    }
+
+    const int x = nb + tx * 4;
+    for (int r = 0; r < 8; r += 4)
+    {
+        const int co = mb + ty * 8 + r;
+        const int base = (co >> 2) * p.outw + x;
+        if (x < p.outw)
+            top_blob_data[base] = vec4(acc[r].x, acc[r + 1].x, acc[r + 2].x, acc[r + 3].x);
+        if (x + 1 < p.outw)
+            top_blob_data[base + 1] = vec4(acc[r].y, acc[r + 1].y, acc[r + 2].y, acc[r + 3].y);
+        if (x + 2 < p.outw)
+            top_blob_data[base + 2] = vec4(acc[r].z, acc[r + 1].z, acc[r + 2].z, acc[r + 3].z);
+        if (x + 3 < p.outw)
+            top_blob_data[base + 3] = vec4(acc[r].w, acc[r + 1].w, acc[r + 2].w, acc[r + 3].w);
+    }
+}

@@ -40,6 +40,8 @@ public:
     bool radish_tiled32;
     bool radish_planar;
     bool radish_pad_channels;
+    bool radish_direct_window;
+    bool radish_direct_weight_half;
 
     // cooperative matrix
     bool use_cooperative_matrix;
