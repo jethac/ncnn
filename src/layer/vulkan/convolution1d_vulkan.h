@@ -37,6 +37,7 @@ public:
     Pipeline* pipeline_radish_planar_pad;
 
     bool use_radish_tiled;
+    bool use_radish_gemm;
     bool radish_tiled32;
     bool radish_planar;
     bool radish_pad_channels;

@@ -1,0 +1,109 @@
+#version 450
+
+// radish (Adreno 506): FP32 GEMM C[M][N] = A[M][K] * B[K][N] (+ bias[m]),
+// 64 rows x 64 columns per workgroup, K in blocks of 32, eight vec4
+// accumulators per invocation. Host local size is 16x8x1.
+//   A: packed rows [Mp][Kp/4] vec4, zero padded to Mp = 64*ceil(M/64) rows
+//      and Kp = 32*ceil(K/32) columns, so A loads need no bounds checks.
+//   B: row k of the reduction, column n. b_pack 4: ncnn pack4 blob,
+//      element ((k/4)*b_stride + n)*4 + k%4; b_pack 1: element k*b_stride + n.
+//   C: four consecutive rows per vec4, c[(m/4)*c_stride + n] (M % 4 == 0).
+// Used for 1x1 Conv1D (C = output channels x positions) and for the GEMM of
+// Deconvolution (rows = output channel group x kernel tap, as col2im reads).
+layout(constant_id = 0) const int K = 32;
+layout(constant_id = 1) const int Kp = 32;
+layout(constant_id = 2) const int b_pack = 4;
+layout(constant_id = 3) const int bias_term = 0;
+
+layout(binding = 0) readonly buffer a_blob { vec4 a_data[]; };
+layout(binding = 1) readonly buffer b_blob { float b_data[]; };
+layout(binding = 2) writeonly buffer c_blob { vec4 c_data[]; };
+layout(binding = 3) readonly buffer bias_blob { float bias_data[]; };
+
+layout(push_constant) uniform parameter
+{
+    int M;
+    int N;
+    int b_stride;
+    int c_stride;
+} p;
+
+// Exactly 16 KiB; all invocations fill and consume both tiles at each barrier.
+shared float sa[32][64];
+shared vec4 sb[32][16];
+
+float load_b(int k, int n)
+{
+    if (k >= K || n >= p.N)
+        return 0.f;
+    if (b_pack == 4)
+        return b_data[((k / 4) * p.b_stride + n) * 4 + k % 4];
+    return b_data[k * p.b_stride + n];
+}
+
+void main()
+{
+    const int tx = int(gl_LocalInvocationID.x);
+    const int ty = int(gl_LocalInvocationID.y);
+    const int tid = ty * 16 + tx;
+    const int mb = int(gl_WorkGroupID.y) * 64;
+    const int nb = int(gl_WorkGroupID.x) * 64;
+    const int Kp4 = Kp / 4;
+
+    vec4 acc[8];
+    for (int r = 0; r < 8; r++)
+    {
+        const int m = mb + ty * 8 + r;
+        acc[r] = vec4(bias_term != 0 && m < p.M ? bias_data[m] : 0.f);
+    }
+
+    for (int k0 = 0; k0 < Kp; k0 += 32)
+    {
+        for (int i = tid; i < 64 * 8; i += 128)
+        {
+            const int r = i / 8;
+            const int q = i % 8;
+            vec4 a = a_data[(mb + r) * Kp4 + k0 / 4 + q];
+            sa[q * 4][r] = a.x;
+            sa[q * 4 + 1][r] = a.y;
+            sa[q * 4 + 2][r] = a.z;
+            sa[q * 4 + 3][r] = a.w;
+        }
+        for (int i = tid; i < 32 * 16; i += 128)
+        {
+            const int r = i / 16;
+            const int q = i % 16;
+            const int n = nb + q * 4;
+            sb[r][q] = vec4(load_b(k0 + r, n), load_b(k0 + r, n + 1), load_b(k0 + r, n + 2), load_b(k0 + r, n + 3));
+        }
+        barrier();
+
+        for (int k = 0; k < 32; k++)
+        {
+            vec4 b = sb[k][tx];
+            for (int r = 0; r < 8; r++)
+            {
+                float a = sa[k][ty * 8 + r];
+                acc[r] += a * b;
+            }
+        }
+        barrier();
+    }
+
+    const int n = nb + tx * 4;
+    for (int r = 0; r < 8; r += 4)
+    {
+        const int m = mb + ty * 8 + r;
+        if (m >= p.M)
+            continue;
+        const int base = (m / 4) * p.c_stride + n;
+        if (n < p.N)
+            c_data[base] = vec4(acc[r].x, acc[r + 1].x, acc[r + 2].x, acc[r + 3].x);
+        if (n + 1 < p.N)
+            c_data[base + 1] = vec4(acc[r].y, acc[r + 1].y, acc[r + 2].y, acc[r + 3].y);
+        if (n + 2 < p.N)
+            c_data[base + 2] = vec4(acc[r].z, acc[r + 1].z, acc[r + 2].z, acc[r + 3].z);
+        if (n + 3 < p.N)
+            c_data[base + 3] = vec4(acc[r].w, acc[r + 1].w, acc[r + 2].w, acc[r + 3].w);
+    }
+}

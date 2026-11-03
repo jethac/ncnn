@@ -39,6 +39,7 @@ public:
 
     // cooperative matrix
     bool use_cooperative_matrix;
+    bool use_radish_gemm;
     int coopmat_M;
     int coopmat_N;
     int coopmat_K;

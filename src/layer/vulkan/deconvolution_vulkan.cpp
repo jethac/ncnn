@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include "deconvolution_vulkan.h"
+#include "radish_gemm.h"
 
 #include "layer_shader_type.h"
 #include "layer_type.h"
@@ -22,6 +23,7 @@ Deconvolution_vulkan::Deconvolution_vulkan()
     pipeline_deconvolution_col2im = 0;
 
     use_cooperative_matrix = false;
+    use_radish_gemm = false;
     coopmat_M = 0;
     coopmat_N = 0;
     coopmat_K = 0;
@@ -109,13 +111,15 @@ int Deconvolution_vulkan::create_pipeline(const Option& opt)
 
     if (opt.use_sgemm_convolution && num_input >= 8 && maxk * num_output >= 8)
     {
+        use_radish_gemm = radish_gemm_available(vkdev, opt) && elempack == 4 && out_elempack == 4
+                          && activation_type == 0 && (maxk * num_output) % 4 == 0;
         Mat out_shape_col;
         if (shape.dims != 0 && out_shape.dims != 0)
         {
             out_shape_col = Mat(shape.w * shape.h, 1, maxk * out_shape.c, (void*)0, out_shape.elemsize, out_elempack);
         }
 
-        use_cooperative_matrix = vkdev->info.support_cooperative_matrix() && opt.use_cooperative_matrix && (opt.use_fp16_storage || opt.use_fp16_packed);
+        use_cooperative_matrix = !use_radish_gemm && vkdev->info.support_cooperative_matrix() && opt.use_cooperative_matrix && (opt.use_fp16_storage || opt.use_fp16_packed);
 
         if (use_cooperative_matrix)
         {
@@ -178,7 +182,35 @@ int Deconvolution_vulkan::create_pipeline(const Option& opt)
             }
         }
 
-        if (use_cooperative_matrix)
+        if (use_radish_gemm)
+        {
+            // rows m = ((co / 4) * maxk + k) * 4 + co % 4, the col layout col2im reads
+            const int M = maxk * num_output;
+            const int Mp = radish_gemm_round(M, 64);
+            const int Kp = radish_gemm_round(num_input, 32);
+            Mat weight_data_r2 = weight_data.reshape(maxk, num_input, num_output);
+            weight_data_packed.create(Kp * Mp, (size_t)4u, 1);
+            weight_data_packed.fill(0.f);
+            float* a = weight_data_packed;
+            for (int co = 0; co < num_output; co++)
+            {
+                for (int k = 0; k < maxk; k++)
+                {
+                    const int m = ((co / 4) * maxk + k) * 4 + co % 4;
+                    for (int ci = 0; ci < num_input; ci++)
+                        a[(size_t)m * Kp + ci] = weight_data_r2.channel(co).row(ci)[k];
+                }
+            }
+            std::vector<vk_specialization_type> specializations(4);
+            specializations[0].i = num_input;
+            specializations[1].i = Kp;
+            specializations[2].i = 4;
+            specializations[3].i = 0;
+            pipeline_deconvolution_gemm = new Pipeline(vkdev);
+            pipeline_deconvolution_gemm->set_local_size_xyz(16, 8, 1);
+            pipeline_deconvolution_gemm->create(LayerShaderType::convolution1d_radish_gemm, opt, specializations);
+        }
+        else if (use_cooperative_matrix)
         {
             //        +-N-+
             //        K   |
@@ -666,7 +698,31 @@ int Deconvolution_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkC
             if (top_blob_col.empty())
                 return -100;
 
-            if (use_cooperative_matrix)
+            if (use_radish_gemm)
+            {
+                if (elempack != 4)
+                    return -1;
+                std::vector<VkMat> bindings(4);
+                bindings[0] = weight_data_gpu;
+                bindings[1] = bottom_blob;
+                bindings[2] = top_blob_col;
+                bindings[3] = weight_data_gpu; // bias unused (applied in col2im)
+
+                const int M = maxk * num_output;
+                std::vector<vk_constant_type> constants(4);
+                constants[0].i = M;
+                constants[1].i = w * h;
+                constants[2].i = bottom_blob.cstep;
+                constants[3].i = top_blob_col.cstep;
+
+                VkMat dispatcher;
+                dispatcher.w = (w * h + 63) / 64 * 16;
+                dispatcher.h = (M + 63) / 64 * 8;
+                dispatcher.c = 1;
+
+                cmd.record_pipeline(pipeline_deconvolution_gemm, bindings, constants, dispatcher);
+            }
+            else if (use_cooperative_matrix)
             {
                 const int size = w * h;
 

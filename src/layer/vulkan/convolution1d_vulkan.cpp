@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include "convolution1d_vulkan.h"
+#include "radish_gemm.h"
 
 #include <limits.h>
 #include <stdint.h>
@@ -229,6 +230,7 @@ Convolution1D_vulkan::Convolution1D_vulkan()
     pipeline_radish_planar_pad = 0;
 
     use_radish_tiled = false;
+    use_radish_gemm = false;
     radish_tiled32 = false;
     radish_planar = false;
     radish_pad_channels = false;
@@ -785,6 +787,31 @@ int Convolution1D_vulkan::create_pipeline(const Option& _opt)
             pipeline_convolution1d_gemm->create(LayerShaderType::convolution1d_packed_gemm, gemm_opt, specializations);
         }
     }
+    else if (is_conv1x1s1d1 && !dynamic_weight && out_elempack == 4 && activation_type == 0
+             && radish_gemm_available(vkdev, opt))
+    {
+        // radish: 1x1 Conv1D as a 64x64-tiled GEMM over [num_output][num_input]
+        use_radish_gemm = true;
+        const int Mp = radish_gemm_round(num_output, 64);
+        const int Kp = radish_gemm_round(num_input, 32);
+        weight_data_packed.create(Kp * Mp, (size_t)4u, 1);
+        if (weight_data_packed.empty())
+            return -100;
+        weight_data_packed.fill(0.f);
+        float* a = weight_data_packed;
+        const float* wsrc = weight_data;
+        for (int co = 0; co < num_output; co++)
+            for (int ci = 0; ci < num_input; ci++)
+                a[(size_t)co * Kp + ci] = wsrc[(size_t)co * num_input + ci];
+        std::vector<vk_specialization_type> specializations(4);
+        specializations[0].i = num_input;
+        specializations[1].i = Kp;
+        specializations[2].i = elempack;
+        specializations[3].i = bias_term;
+        pipeline_convolution1d_gemm = new Pipeline(vkdev);
+        pipeline_convolution1d_gemm->set_local_size_xyz(16, 8, 1);
+        pipeline_convolution1d_gemm->create(LayerShaderType::convolution1d_radish_gemm, opt, specializations);
+    }
     else if (is_conv1x1s1d1)
     {
         use_cooperative_matrix = vkdev->info.support_cooperative_matrix() && opt.use_cooperative_matrix && (opt.use_fp16_storage || opt.use_fp16_packed) && num_input >= 8 && num_output >= 8;
@@ -1085,6 +1112,7 @@ int Convolution1D_vulkan::destroy_pipeline(const Option& opt)
     pipeline_radish_planar_pad = 0;
 
     use_radish_tiled = false;
+    use_radish_gemm = false;
     radish_tiled32 = false;
     radish_planar = false;
     radish_pad_channels = false;
@@ -1499,6 +1527,32 @@ int Convolution1D_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkC
                     && !is_conv1x1s1d1
                     && num_input * maxk >= 8
                     && num_output >= 8;
+
+    if (use_radish_gemm)
+    {
+        if (!pipeline_convolution1d_gemm || bottom_blob_bordered.dims != 2 || outw <= 0
+            || bottom_blob_bordered.h * elempack != num_input)
+            return -1;
+        top_blob.create(outw, num_output / 4, (size_t)16u, 4, opt.blob_vkallocator);
+        if (top_blob.empty())
+            return -100;
+        std::vector<VkMat> bindings(4);
+        bindings[0] = weight_data_gpu;
+        bindings[1] = bottom_blob_bordered;
+        bindings[2] = top_blob;
+        bindings[3] = bias_term ? bias_data_gpu : weight_data_gpu;
+        std::vector<vk_constant_type> constants(4);
+        constants[0].i = num_output;
+        constants[1].i = outw;
+        constants[2].i = bottom_blob_bordered.w;
+        constants[3].i = outw;
+        VkMat dispatcher;
+        dispatcher.w = (outw + 63) / 64 * 16;
+        dispatcher.h = (num_output + 63) / 64 * 8;
+        dispatcher.c = 1;
+        cmd.record_pipeline(pipeline_convolution1d_gemm, bindings, constants, dispatcher);
+        return 0;
+    }
 
     if (use_radish_tiled)
     {
