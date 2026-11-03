@@ -38,6 +38,9 @@ public:
 
     bool use_radish_tiled;
     bool use_radish_gemm;
+    bool use_radish_wino;
+    Pipeline* pipeline_radish_wino_in;
+    Pipeline* pipeline_radish_wino_out;
     bool radish_tiled32;
     bool radish_planar;
     bool radish_pad_channels;

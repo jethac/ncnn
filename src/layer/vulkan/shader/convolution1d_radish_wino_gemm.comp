@@ -1,0 +1,120 @@
+#version 450
+
+// radish F(6,3) Winograd Conv1D, the 8 batched GEMMs (workgroup z = point i):
+// M[i][co][t] = sum_{c, ci} U[i][co][c * cin + ci] * V[c % 2][i][ci][t + (c / 2) D].
+// U[i][co][c * cin + ci] = sum_j G[i][j] * w[co][c][j][ci] is computed while
+// loading the A tile from weights repacked as [cout][chunks][3][cin] (taps past
+// kw zeroed): ~1.1x the original weights instead of ~2.9x for stored U. 64x64 tiles, K blocks of
+// 32, 16 KiB shared, local size 16x8 as convolution1d_radish_gemm.
+layout(constant_id = 0) const int K = 32;
+layout(constant_id = 1) const int Kp = 32;
+layout(constant_id = 2) const int cin = 4;
+layout(constant_id = 3) const int D = 1;
+layout(constant_id = 4) const int kw = 3;
+
+layout(binding = 0) readonly buffer a_blob { vec4 a_data[]; };
+layout(binding = 1) readonly buffer b_blob { float b_data[]; };
+layout(binding = 2) writeonly buffer c_blob { float c_data[]; };
+
+layout(push_constant) uniform parameter
+{
+    int M;
+    int N;
+    int Tv;
+} p;
+
+// Exactly 16 KiB; all invocations fill and consume both tiles at each barrier.
+shared float sa[32][64];
+shared vec4 sb[32][16];
+int wi;
+vec3 gi;
+
+vec4 load_a4(int m, int k)
+{
+    // k is a multiple of 4 and cin % 4 == 0, so the four lanes share one chunk
+    if (m >= p.M || k >= K)
+        return vec4(0.f);
+    const int c = k / cin;
+    const int ci4 = (k - c * cin) / 4;
+    const int base = ((m * (K / cin) + c) * 3) * (cin / 4) + ci4;
+    return gi.x * a_data[base] + gi.y * a_data[base + cin / 4] + gi.z * a_data[base + 2 * (cin / 4)];
+}
+
+float load_b(int k, int n)
+{
+    if (k >= K || n >= p.N)
+        return 0.f;
+    const int c = k / cin;
+    const int ci = k - c * cin;
+    return b_data[(((c & 1) * 8 + wi) * cin + ci) * p.Tv + n + (c >> 1) * D];
+}
+
+void main()
+{
+    wi = int(gl_WorkGroupID.z);
+    const vec3 G[8] = vec3[8](vec3(1.f, 0.f, 0.f), vec3(-2.f / 9.f), vec3(-2.f / 9.f, 2.f / 9.f, -2.f / 9.f),
+                              vec3(1.f / 90.f, 1.f / 45.f, 2.f / 45.f), vec3(1.f / 90.f, -1.f / 45.f, 2.f / 45.f),
+                              vec3(32.f / 45.f, 16.f / 45.f, 8.f / 45.f), vec3(32.f / 45.f, -16.f / 45.f, 8.f / 45.f),
+                              vec3(0.f, 0.f, 1.f));
+    gi = G[wi];
+    const int tx = int(gl_LocalInvocationID.x);
+    const int ty = int(gl_LocalInvocationID.y);
+    const int tid = ty * 16 + tx;
+    const int mb = int(gl_WorkGroupID.y) * 64;
+    const int nb = int(gl_WorkGroupID.x) * 64;
+    const int Kp4 = Kp / 4;
+
+    vec4 acc[8];
+    for (int r = 0; r < 8; r++)
+    {
+        const int m = mb + ty * 8 + r;
+        acc[r] = vec4(0.f);
+    }
+
+    for (int k0 = 0; k0 < Kp; k0 += 32)
+    {
+        for (int i = tid; i < 64 * 8; i += 128)
+        {
+            const int r = i / 8;
+            const int q = i % 8;
+            const int kk = k0 + q * 4;
+            vec4 a = load_a4(mb + r, kk);
+            sa[q * 4][r] = a.x;
+            sa[q * 4 + 1][r] = a.y;
+            sa[q * 4 + 2][r] = a.z;
+            sa[q * 4 + 3][r] = a.w;
+        }
+        for (int i = tid; i < 32 * 16; i += 128)
+        {
+            const int r = i / 16;
+            const int q = i % 16;
+            const int n = nb + q * 4;
+            sb[r][q] = vec4(load_b(k0 + r, n), load_b(k0 + r, n + 1), load_b(k0 + r, n + 2), load_b(k0 + r, n + 3));
+        }
+        barrier();
+
+        for (int k = 0; k < 32; k++)
+        {
+            vec4 b = sb[k][tx];
+            for (int r = 0; r < 8; r++)
+            {
+                float a = sa[k][ty * 8 + r];
+                acc[r] += a * b;
+            }
+        }
+        barrier();
+    }
+
+    const int n = nb + tx * 4;
+    for (int r = 0; r < 8; r++)
+    {
+        const int m = mb + ty * 8 + r;
+        if (m >= p.M)
+            continue;
+        const int base = (wi * p.M + m) * p.N + n;
+        if (n < p.N) c_data[base] = acc[r].x;
+        if (n + 1 < p.N) c_data[base + 1] = acc[r].y;
+        if (n + 2 < p.N) c_data[base + 2] = acc[r].z;
+        if (n + 3 < p.N) c_data[base + 3] = acc[r].w;
+    }
+}

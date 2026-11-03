@@ -228,9 +228,12 @@ Convolution1D_vulkan::Convolution1D_vulkan()
     pipeline_convolution1d_1x1s1d1 = 0;
     pipeline_convolution1d_gemm = 0;
     pipeline_radish_planar_pad = 0;
+    pipeline_radish_wino_in = 0;
+    pipeline_radish_wino_out = 0;
 
     use_radish_tiled = false;
     use_radish_gemm = false;
+    use_radish_wino = false;
     radish_tiled32 = false;
     radish_planar = false;
     radish_pad_channels = false;
@@ -353,6 +356,20 @@ int Convolution1D_vulkan::create_pipeline(const Option& _opt)
                            && num_input == 128 && num_output == 128 && kernel_w == 11
                            && bias_term == 1 && !dynamic_weight;
 
+    // radish F(6,3) Winograd for stride-1 k=3/7/11 Conv1D (RADISH_NCNN_WINOGRAD=1)
+    const char* wino_env = getenv("RADISH_NCNN_WINOGRAD");
+    use_radish_wino = wino_env && strcmp(wino_env, "1") == 0 && radish_gemm_available(vkdev, opt)
+                      && stride_w == 1 && (kernel_w == 3 || kernel_w == 7 || kernel_w == 11)
+                      && elempack == 4 && out_elempack == 4 && activation_type == 0 && !dynamic_weight
+                      && (long long)num_input * kernel_w * num_output == weight_data_size;
+    if (use_radish_wino)
+    {
+        use_radish_tiled = false;
+        radish_tiled32 = false;
+        radish_planar = false;
+        radish_direct_window = false;
+    }
+
     const char* pad_channels_env = getenv("RADISH_NCNN_PAD_CHANNELS");
     radish_pad_channels = pad_channels_env && strcmp(pad_channels_env, "1") == 0
                           && tiled_env && strcmp(tiled_env, "1") == 0
@@ -441,7 +458,52 @@ int Convolution1D_vulkan::create_pipeline(const Option& _opt)
         return 0;
     }
 
-    if (use_radish_tiled)
+    if (use_radish_wino)
+    {
+        // The GEMM transforms the original weights while loading (see shader).
+        const int C = (kernel_w + 2) / 3;
+        const int K = C * num_input;
+        const int Kp = radish_gemm_round(K, 32);
+        weight_data_packed.create(num_output * C * 3 * num_input, (size_t)4u, 1);
+        if (weight_data_packed.empty())
+            return -100;
+        weight_data_packed.fill(0.f);
+        {
+            float* dst = weight_data_packed;
+            const float* src = weight_data;
+            for (int co = 0; co < num_output; co++)
+                for (int c = 0; c < C; c++)
+                    for (int j = 0; j < 3 && 3 * c + j < kernel_w; j++)
+                        for (int ci = 0; ci < num_input; ci++)
+                            dst[(((size_t)co * C + c) * 3 + j) * num_input + ci] = src[((size_t)co * num_input + ci) * kernel_w + 3 * c + j];
+        }
+
+        std::vector<vk_specialization_type> sin(2);
+        sin[0].i = num_input;
+        sin[1].i = dilation_w;
+        pipeline_radish_wino_in = new Pipeline(vkdev);
+        pipeline_radish_wino_in->set_local_size_xyz(64, 1, 1);
+        pipeline_radish_wino_in->create(LayerShaderType::convolution1d_radish_wino_in, opt, sin);
+
+        std::vector<vk_specialization_type> sg(5);
+        sg[0].i = K;
+        sg[1].i = Kp;
+        sg[2].i = num_input;
+        sg[3].i = dilation_w;
+        sg[4].i = kernel_w;
+        pipeline_convolution1d_gemm = new Pipeline(vkdev);
+        pipeline_convolution1d_gemm->set_local_size_xyz(16, 8, 1);
+        pipeline_convolution1d_gemm->create(LayerShaderType::convolution1d_radish_wino_gemm, opt, sg);
+
+        std::vector<vk_specialization_type> so(3);
+        so[0].i = num_output;
+        so[1].i = dilation_w;
+        so[2].i = bias_term;
+        pipeline_radish_wino_out = new Pipeline(vkdev);
+        pipeline_radish_wino_out->set_local_size_xyz(64, 1, 1);
+        pipeline_radish_wino_out->create(LayerShaderType::convolution1d_radish_wino_out, opt, so);
+    }
+    else if (use_radish_tiled)
     {
         if (radish_planar && requested_packed_a)
         {
@@ -1111,8 +1173,15 @@ int Convolution1D_vulkan::destroy_pipeline(const Option& opt)
     delete pipeline_radish_planar_pad;
     pipeline_radish_planar_pad = 0;
 
+    delete pipeline_radish_wino_in;
+    pipeline_radish_wino_in = 0;
+
+    delete pipeline_radish_wino_out;
+    pipeline_radish_wino_out = 0;
+
     use_radish_tiled = false;
     use_radish_gemm = false;
+    use_radish_wino = false;
     radish_tiled32 = false;
     radish_planar = false;
     radish_pad_channels = false;
@@ -1527,6 +1596,83 @@ int Convolution1D_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkC
                     && !is_conv1x1s1d1
                     && num_input * maxk >= 8
                     && num_output >= 8;
+
+    if (use_radish_wino)
+    {
+        if (!pipeline_convolution1d_gemm || !pipeline_radish_wino_in || !pipeline_radish_wino_out
+            || bottom_blob_bordered.dims != 2 || bottom_blob_bordered.elempack != 4 || outw <= 0
+            || bottom_blob_bordered.h * 4 != num_input)
+            return -1;
+        const int D = dilation_w;
+        const int C = (kernel_w + 2) / 3;
+        const int T = D * ((outw + 6 * D - 1) / (6 * D));
+        const int Tv = T + (C / 2) * D;
+
+        // Chunks of tiles through one scratch pair: VkCompute keeps every bound
+        // VkMat alive until submit, so whole-layer scratch would accumulate.
+        const char* tiles_env = getenv("RADISH_WINO_TILES");
+        const int tiles = tiles_env ? std::max(64, atoi(tiles_env)) : 256;
+        const int Tc = std::min(T, tiles);
+        const int Tvc = Tc + (C / 2) * D;
+        VkMat v_blob;
+        v_blob.create(2 * 8 * num_input * Tvc, (size_t)4u, 1, opt.workspace_vkallocator);
+        VkMat m_blob;
+        m_blob.create(8 * num_output * Tc, (size_t)4u, 1, opt.workspace_vkallocator);
+        top_blob.create(outw, num_output / 4, (size_t)16u, 4, opt.blob_vkallocator);
+        if (v_blob.empty() || m_blob.empty() || top_blob.empty())
+            return -100;
+        (void)Tv;
+        for (int t0 = 0; t0 < T; t0 += Tc)
+        {
+            const int tc = std::min(Tc, T - t0);
+            const int tvc = tc + (C / 2) * D;
+            {
+                std::vector<VkMat> bindings(2);
+                bindings[0] = bottom_blob_bordered;
+                bindings[1] = v_blob;
+                std::vector<vk_constant_type> constants(3);
+                constants[0].i = bottom_blob_bordered.w;
+                constants[1].i = tvc;
+                constants[2].i = t0;
+                VkMat dispatcher;
+                dispatcher.w = tvc;
+                dispatcher.h = num_input / 4;
+                dispatcher.c = 2;
+                cmd.record_pipeline(pipeline_radish_wino_in, bindings, constants, dispatcher);
+            }
+            {
+                std::vector<VkMat> bindings(3);
+                bindings[0] = weight_data_gpu;
+                bindings[1] = v_blob;
+                bindings[2] = m_blob;
+                std::vector<vk_constant_type> constants(3);
+                constants[0].i = num_output;
+                constants[1].i = tc;
+                constants[2].i = tvc;
+                VkMat dispatcher;
+                dispatcher.w = (tc + 63) / 64 * 16;
+                dispatcher.h = (num_output + 63) / 64 * 8;
+                dispatcher.c = 8;
+                cmd.record_pipeline(pipeline_convolution1d_gemm, bindings, constants, dispatcher);
+            }
+            {
+                std::vector<VkMat> bindings(3);
+                bindings[0] = m_blob;
+                bindings[1] = top_blob;
+                bindings[2] = bias_term ? bias_data_gpu : m_blob;
+                std::vector<vk_constant_type> constants(3);
+                constants[0].i = outw;
+                constants[1].i = tc;
+                constants[2].i = t0;
+                VkMat dispatcher;
+                dispatcher.w = tc;
+                dispatcher.h = num_output / 4;
+                dispatcher.c = 1;
+                cmd.record_pipeline(pipeline_radish_wino_out, bindings, constants, dispatcher);
+            }
+        }
+        return 0;
+    }
 
     if (use_radish_gemm)
     {

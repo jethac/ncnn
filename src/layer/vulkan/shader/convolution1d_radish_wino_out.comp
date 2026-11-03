@@ -1,0 +1,56 @@
+#version 450
+
+// radish F(6,3) Winograd Conv1D, output transform.
+// y[co][s + jD] = bias[co] + sum_i AT[j][i] * M[(i * cout + co) * T + t].
+// Output: ncnn pack4 2D blob (rows of outw vec4). One invocation per (t, co/4).
+layout(constant_id = 0) const int cout = 4;
+layout(constant_id = 1) const int D = 1;
+layout(constant_id = 2) const int bias_term = 0;
+
+layout(binding = 0) readonly buffer m_blob { float m_data[]; };
+layout(binding = 1) writeonly buffer top_blob { vec4 top_blob_data[]; };
+layout(binding = 2) readonly buffer bias_blob { vec4 bias_data[]; };
+
+layout(push_constant) uniform parameter
+{
+    int outw;
+    int T;  // tiles in this chunk
+    int t0; // first tile of the chunk
+} p;
+
+void main()
+{
+    const int tl = int(gl_GlobalInvocationID.x);
+    const int t = p.t0 + tl;
+    const int c4 = int(gl_GlobalInvocationID.y);
+    if (tl >= p.T || c4 >= cout / 4)
+        return;
+
+    vec4 m[8];
+    for (int i = 0; i < 8; i++)
+    {
+        const int row = i * cout + c4 * 4;
+        m[i] = vec4(m_data[row * p.T + tl], m_data[(row + 1) * p.T + tl],
+                    m_data[(row + 2) * p.T + tl], m_data[(row + 3) * p.T + tl]);
+    }
+    const vec4 bias = bias_term != 0 ? bias_data[c4] : vec4(0.f);
+
+    const vec4 a1 = m[1] + m[2], b1 = m[1] - m[2];
+    const vec4 a2 = m[3] + m[4], b2 = m[3] - m[4];
+    const vec4 a3 = m[5] + m[6], b3 = m[5] - m[6];
+    vec4 y[6];
+    y[0] = m[0] + a1 + a2 + a3;
+    y[1] = b1 + 2.f * b2 + 0.5f * b3;
+    y[2] = a1 + 4.f * a2 + 0.25f * a3;
+    y[3] = b1 + 8.f * b2 + 0.125f * b3;
+    y[4] = a1 + 16.f * a2 + 0.0625f * a3;
+    y[5] = b1 + 32.f * b2 + 0.03125f * b3 + m[7];
+
+    const int s = (t / D) * 6 * D + t % D;
+    for (int j = 0; j < 6; j++)
+    {
+        const int x = s + j * D;
+        if (x < p.outw)
+            top_blob_data[c4 * p.outw + x] = y[j] + bias;
+    }
+}

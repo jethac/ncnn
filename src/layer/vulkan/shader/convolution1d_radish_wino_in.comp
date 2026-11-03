@@ -1,0 +1,62 @@
+#version 450
+
+// radish F(6,3) Winograd Conv1D, input transform. Tile t covers outputs
+// s + j*D (j < 6) with s = (t / D) * 6D + t % D; offset o (0 or 1) shifts the
+// 8-point input window by 3*o*D for odd 3-tap chunks of longer kernels.
+// V[((o * 8 + i) * cin + ci) * Tv + t] = sum_j BT[i][j] * in[ci][s + 3oD + jD].
+// Input: ncnn pack4 2D blob (rows of w_in vec4). One invocation per (t, ci/4, o).
+layout(constant_id = 0) const int cin = 4;
+layout(constant_id = 1) const int D = 1;
+
+layout(binding = 0) readonly buffer bottom_blob { vec4 bottom_blob_data[]; };
+layout(binding = 1) writeonly buffer v_blob { float v_data[]; };
+
+layout(push_constant) uniform parameter
+{
+    int w_in;
+    int Tv; // tiles in this chunk's V (chunk tiles + shift)
+    int t0; // first tile of the chunk
+} p;
+
+void main()
+{
+    const int tl = int(gl_GlobalInvocationID.x);
+    const int t = p.t0 + tl;
+    const int c4 = int(gl_GlobalInvocationID.y);
+    const int o = int(gl_GlobalInvocationID.z);
+    if (tl >= p.Tv || c4 >= cin / 4 || o >= 2)
+        return;
+
+    const int base = (t / D) * 6 * D + t % D + 3 * o * D;
+    vec4 d[8];
+    for (int j = 0; j < 8; j++)
+    {
+        const int x = base + j * D;
+        d[j] = x < p.w_in ? bottom_blob_data[c4 * p.w_in + x] : vec4(0.f);
+    }
+
+    vec4 v[8];
+    v[0] = d[0] - 5.25f * d[2] + 5.25f * d[4] - d[6];
+    vec4 a = d[1] - 4.25f * d[3] + d[5];
+    vec4 b = d[2] - 4.25f * d[4] + d[6];
+    v[1] = a + b;
+    v[2] = b - a;
+    a = 0.5f * d[1] - 2.5f * d[3] + 2.f * d[5];
+    b = 0.25f * d[2] - 1.25f * d[4] + d[6];
+    v[3] = a + b;
+    v[4] = b - a;
+    a = 2.f * d[1] - 2.5f * d[3] + 0.5f * d[5];
+    b = 4.f * d[2] - 5.f * d[4] + d[6];
+    v[5] = a + b;
+    v[6] = b - a;
+    v[7] = d[7] - d[1] + 5.25f * d[3] - 5.25f * d[5];
+
+    for (int i = 0; i < 8; i++)
+    {
+        const int row = (o * 8 + i) * cin + c4 * 4;
+        v_data[(row + 0) * p.Tv + tl] = v[i].x;
+        v_data[(row + 1) * p.Tv + tl] = v[i].y;
+        v_data[(row + 2) * p.Tv + tl] = v[i].z;
+        v_data[(row + 3) * p.Tv + tl] = v[i].w;
+    }
+}
